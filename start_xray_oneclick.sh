@@ -44,6 +44,7 @@ QR_BUNDLE_ZIP="${QR_BUNDLE_ZIP:-${PUBLIC_FILES_DIR}/qr_bundle.zip}"
 FILE_HTTP_PORT="${FILE_HTTP_PORT:-18089}"
 FILE_SERVICE_NAME="${FILE_SERVICE_NAME:-xray-oneclick-files.service}"
 AUTO_QR_FILE_SERVER="${AUTO_QR_FILE_SERVER:-1}"
+MENU_ENABLED="${MENU_ENABLED:-1}"
 NO_SERVICE_MODE=0
 
 usage() {
@@ -81,6 +82,7 @@ Key env vars:
   SERVICE_NAME      managed systemd unit name (default: xray-oneclick.service)
   AUTO_QR_FILE_SERVER auto-start file server for QR bundle zip (1/0, default: 1)
   FILE_HTTP_PORT    file server port for QR bundle download (default: 18089)
+  MENU_ENABLED      show interactive management menu in TTY mode (1/0, default: 1)
 EOF
 }
 
@@ -220,6 +222,114 @@ PY
   fi
 
   return 1
+}
+
+show_service_status() {
+  local main_state="inactive"
+  local file_state="inactive"
+  echo "=== Service Status ==="
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
+      main_state="active"
+    fi
+    if systemctl is-active --quiet "${FILE_SERVICE_NAME}" 2>/dev/null; then
+      file_state="active"
+    fi
+    echo "- ${SERVICE_NAME}: ${main_state}"
+    echo "- ${FILE_SERVICE_NAME}: ${file_state}"
+  else
+    echo "systemctl not found"
+  fi
+
+  echo "=== Listener Ports ==="
+  if [[ -f "${DEPLOY_TARGET}" ]]; then
+    python3 - <<PY
+import json
+from pathlib import Path
+p=Path("${DEPLOY_TARGET}")
+try:
+    c=json.loads(p.read_text())
+except Exception:
+    print("config parse failed:", p)
+    raise SystemExit(0)
+ports=[str(b.get("port")) for b in c.get("inbounds",[]) if b.get("port")]
+print("configured inbound ports:", ",".join(ports) if ports else "none")
+PY
+  fi
+  ss -lnt 2>/dev/null | awk 'NR==1 || /:20[0-9]{3}|:18[0-9]{3}/'
+}
+
+service_action() {
+  local action="$1"
+  if ! command -v systemctl >/dev/null 2>&1; then
+    echo "systemctl not found"
+    return 1
+  fi
+  if systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -Fxq "${SERVICE_NAME}"; then
+    systemctl "${action}" "${SERVICE_NAME}" || true
+  else
+    echo "${SERVICE_NAME} not found"
+  fi
+  if systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -Fxq "${FILE_SERVICE_NAME}"; then
+    systemctl "${action}" "${FILE_SERVICE_NAME}" || true
+  fi
+}
+
+show_recent_logs() {
+  echo "=== Logs: ${SERVICE_NAME} ==="
+  if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -Fxq "${SERVICE_NAME}"; then
+    journalctl -u "${SERVICE_NAME}" -n 80 --no-pager || true
+  else
+    echo "service log not available, fallback:"
+    tail -n 80 "${STANDALONE_LOG_FILE}" 2>/dev/null || true
+  fi
+}
+
+show_qr_bundle_download() {
+  local host="${PUBLIC_HOST}"
+  if [[ -z "${host}" ]]; then
+    host="$(detect_public_host || true)"
+  fi
+  if [[ -z "${host}" ]]; then
+    host="YOUR_PUBLIC_IP"
+  fi
+  if [[ -f "${QR_BUNDLE_ZIP}" ]]; then
+    echo "QR bundle download:"
+    echo "http://${host}:${FILE_HTTP_PORT}/$(basename "${QR_BUNDLE_ZIP}")"
+  else
+    echo "QR bundle not found: ${QR_BUNDLE_ZIP}"
+  fi
+}
+
+interactive_menu() {
+  local choice=""
+  while true; do
+    cat <<EOF
+
+======== Xray OneClick Menu ========
+1) Generate / Update Nodes
+2) Show Service Status
+3) Start Services
+4) Restart Services
+5) Stop Services
+6) Show Recent Logs
+7) Show QR Bundle Download Link
+0) Exit
+====================================
+EOF
+    read -r -p "Select: " choice || true
+    case "${choice}" in
+      1) return 0 ;;
+      2) show_service_status ;;
+      3) service_action start ;;
+      4) service_action restart ;;
+      5) service_action stop ;;
+      6) show_recent_logs ;;
+      7) show_qr_bundle_download ;;
+      0|q|Q) exit 0 ;;
+      *) echo "invalid selection" ;;
+    esac
+  done
 }
 
 detect_xray_bin() {
@@ -479,6 +589,10 @@ done
 if [[ -n "${INPUT_FILE}" && ! -f "${INPUT_FILE}" ]]; then
   echo "ERROR: input file not found: ${INPUT_FILE}" >&2
   exit 1
+fi
+
+if [[ -t 0 && -z "${INPUT_FILE}" && "${MENU_ENABLED}" == "1" ]]; then
+  interactive_menu
 fi
 
 if [[ -t 0 ]]; then
