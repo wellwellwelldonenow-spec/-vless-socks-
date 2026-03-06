@@ -489,18 +489,23 @@ def build_share_links(
     v2rayn_lines = []
     shadowrocket_lines = []
     country_cache: dict[str, str] = {}
-    used_remarks: set[str] = set()
     for row in mapping:
         socks_host = str(row.get("socks_host", "")).strip()
-        display_ip = resolve_host_to_ip(socks_host) if socks_host else "unknown-ip"
-        if display_ip not in country_cache:
-            country_cache[display_ip] = query_country_by_ip(display_ip)
-        country = country_cache[display_ip]
-        base_remark = sanitize_remark(f"{display_ip}-{country}")
-        remark = base_remark
-        if remark in used_remarks:
-            remark = sanitize_remark(f"{base_remark}-{remark_prefix}-{row['index']:03d}")
-        used_remarks.add(remark)
+        display_host = socks_host if socks_host else "unknown-host"
+        try:
+            ipaddress.ip_address(display_host)
+            lookup_target = display_host
+        except ValueError:
+            lookup_target = ""
+
+        if lookup_target:
+            if lookup_target not in country_cache:
+                country_cache[lookup_target] = query_country_by_ip(lookup_target)
+            country = country_cache[lookup_target]
+        else:
+            country = "Unknown"
+
+        remark = sanitize_remark(f"{display_host}-{country}-{remark_prefix}-{int(row['index']):03d}")
         link = build_vless_link(
             host=public_host,
             port=int(row["inbound_port"]),

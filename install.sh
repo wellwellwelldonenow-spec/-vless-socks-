@@ -40,15 +40,17 @@ download_file() {
 if [[ -n "${RAW_BASE}" ]]; then
   download_file "${RAW_BASE}/start_xray_oneclick.sh" "${INSTALL_DIR}/start_xray_oneclick.sh"
   download_file "${RAW_BASE}/generate_xray_1to1.py" "${INSTALL_DIR}/generate_xray_1to1.py"
+  download_file "${RAW_BASE}/qr_download_server.py" "${INSTALL_DIR}/qr_download_server.py"
 else
   SCRIPT_PATH="${BASH_SOURCE[0]-}"
   SCRIPT_DIR=""
   if [[ -n "${SCRIPT_PATH}" ]] && [[ -f "${SCRIPT_PATH}" ]]; then
     SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
   fi
-  if [[ -n "${SCRIPT_DIR}" ]] && [[ -f "${SCRIPT_DIR}/start_xray_oneclick.sh" && -f "${SCRIPT_DIR}/generate_xray_1to1.py" ]]; then
+  if [[ -n "${SCRIPT_DIR}" ]] && [[ -f "${SCRIPT_DIR}/start_xray_oneclick.sh" && -f "${SCRIPT_DIR}/generate_xray_1to1.py" && -f "${SCRIPT_DIR}/qr_download_server.py" ]]; then
     cp "${SCRIPT_DIR}/start_xray_oneclick.sh" "${INSTALL_DIR}/start_xray_oneclick.sh"
     cp "${SCRIPT_DIR}/generate_xray_1to1.py" "${INSTALL_DIR}/generate_xray_1to1.py"
+    cp "${SCRIPT_DIR}/qr_download_server.py" "${INSTALL_DIR}/qr_download_server.py"
   else
     echo "ERROR: cannot locate scripts locally, and REPO_SLUG is empty." >&2
     echo "Usage: install.sh <github_user/repo>" >&2
@@ -56,7 +58,7 @@ else
   fi
 fi
 
-chmod +x "${INSTALL_DIR}/start_xray_oneclick.sh" "${INSTALL_DIR}/generate_xray_1to1.py"
+chmod +x "${INSTALL_DIR}/start_xray_oneclick.sh" "${INSTALL_DIR}/generate_xray_1to1.py" "${INSTALL_DIR}/qr_download_server.py"
 
 cat > "${BIN_DIR}/xray-oneclick" <<EOF
 #!/usr/bin/env bash
@@ -67,6 +69,7 @@ chmod +x "${BIN_DIR}/xray-oneclick"
 echo "Installed:"
 echo "  ${INSTALL_DIR}/start_xray_oneclick.sh"
 echo "  ${INSTALL_DIR}/generate_xray_1to1.py"
+echo "  ${INSTALL_DIR}/qr_download_server.py"
 echo "Command:"
 echo "  ${BIN_DIR}/xray-oneclick"
 

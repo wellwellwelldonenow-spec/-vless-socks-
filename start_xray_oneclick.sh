@@ -44,10 +44,13 @@ QR_BUNDLE_ZIP="${QR_BUNDLE_ZIP:-${PUBLIC_FILES_DIR}/qr_bundle.zip}"
 FILE_HTTP_PORT="${FILE_HTTP_PORT:-18089}"
 FILE_SERVICE_NAME="${FILE_SERVICE_NAME:-xray-oneclick-files.service}"
 AUTO_QR_FILE_SERVER="${AUTO_QR_FILE_SERVER:-1}"
+DOWNLOAD_KEY_FILE="${DOWNLOAD_KEY_FILE:-${PUBLIC_FILES_DIR}/download.key}"
+QR_SERVER_SCRIPT="${QR_SERVER_SCRIPT:-${BASE_DIR}/qr_download_server.py}"
 MENU_ENABLED="${MENU_ENABLED:-1}"
 NODES_DB="${NODES_DB:-/opt/xray-oneclick/nodes.csv}"
 START_PORT_FILE="${START_PORT_FILE:-/opt/xray-oneclick/start_port}"
 USE_SAVED_PORT=0
+DOWNLOAD_KEY=""
 NO_SERVICE_MODE=0
 
 usage() {
@@ -85,6 +88,7 @@ Key env vars:
   SERVICE_NAME      managed systemd unit name (default: xray-oneclick.service)
   AUTO_QR_FILE_SERVER auto-start file server for QR bundle zip (1/0, default: 1)
   FILE_HTTP_PORT    file server port for QR bundle download (default: 18089)
+  DOWNLOAD_KEY_FILE download key file path for QR bundle (default: /opt/xray-oneclick/public/download.key)
   MENU_ENABLED      show interactive management menu in TTY mode (1/0, default: 1)
   NODES_DB          node source file for management menu (default: /opt/xray-oneclick/nodes.csv)
 EOF
@@ -133,6 +137,17 @@ ensure_nodes_db_dir() {
   mkdir -p "$(dirname "${NODES_DB}")"
 }
 
+generate_download_key() {
+  mkdir -p "$(dirname "${DOWNLOAD_KEY_FILE}")"
+  DOWNLOAD_KEY="$(python3 - <<'PY'
+import secrets
+print(secrets.token_urlsafe(12))
+PY
+)"
+  echo "${DOWNLOAD_KEY}" > "${DOWNLOAD_KEY_FILE}"
+  chmod 600 "${DOWNLOAD_KEY_FILE}" || true
+}
+
 persist_nodes_db_from_input() {
   local src="$1"
   local tmp=""
@@ -157,7 +172,7 @@ load_saved_start_port() {
     saved="$(tr -d '[:space:]' < "${START_PORT_FILE}" || true)"
     if [[ "${saved}" =~ ^[0-9]+$ ]] && (( saved >= 1 && saved <= 65535 )); then
       START_PORT="${saved}"
-      echo "using saved START_PORT=${START_PORT}"
+      echo "使用已保存 START_PORT=${START_PORT}"
       return 0
     fi
   fi
@@ -167,7 +182,7 @@ load_saved_start_port() {
 prompt_start_port() {
   local input=""
   while true; do
-    read -r -p "Inbound start port [${START_PORT}]: " input || true
+    read -r -p "请输入入站起始端口 [${START_PORT}]: " input || true
     input="$(echo "${input}" | tr -d '[:space:]')"
     if [[ -z "${input}" ]]; then
       break
@@ -176,21 +191,21 @@ prompt_start_port() {
       START_PORT="${input}"
       break
     fi
-    echo "Invalid port. Please enter 1-65535."
+    echo "端口无效，请输入 1-65535"
   done
-  echo "using START_PORT=${START_PORT}"
+  echo "使用 START_PORT=${START_PORT}"
 }
 
 list_nodes_db() {
   if [[ ! -f "${NODES_DB}" ]]; then
-    echo "nodes db not found: ${NODES_DB}"
+    echo "节点库不存在: ${NODES_DB}"
     return 1
   fi
   awk '
     /^[[:space:]]*$/ {next}
     /^[[:space:]]*#/ {next}
     {print ++n ". " $0}
-    END{if(n==0) print "no nodes"}
+    END{if(n==0) print "暂无节点"}
   ' "${NODES_DB}"
 }
 
@@ -201,8 +216,8 @@ collect_nodes_append_to_db() {
   local blank_count=0
   local data_count=0
   tmp="$(mktemp /tmp/node_add.XXXXXX)"
-  echo "Paste SOCKS lines to add (host:port:user:pass)"
-  echo "Finish with: end / END / 结束 / double Enter / Ctrl+D"
+  echo "请粘贴要新增的 SOCKS（格式 host:port:user:pass）"
+  echo "结束方式: end / END / 结束 / 连续两次回车 / Ctrl+D"
   while IFS= read -r line || [[ -n "${line}" ]]; do
     normalized="$(echo "${line}" | tr -d '[:space:]')"
     if [[ "${normalized}" == "end" || "${normalized}" == "END" || "${normalized}" == "结束" ]]; then
@@ -223,14 +238,14 @@ collect_nodes_append_to_db() {
   done
   if (( data_count == 0 )); then
     rm -f "${tmp}"
-    echo "no lines added"
+    echo "未新增任何节点"
     return 1
   fi
   ensure_nodes_db_dir
   touch "${NODES_DB}"
   cat "${tmp}" >> "${NODES_DB}"
   rm -f "${tmp}"
-  echo "nodes appended into ${NODES_DB}"
+  echo "新增完成，已写入: ${NODES_DB}"
   return 0
 }
 
@@ -260,11 +275,11 @@ delete_nodes_by_csv_indices() {
   local csv_indices="$1"
   local tmp=""
   if [[ -z "${csv_indices}" ]]; then
-    echo "no valid indices"
+    echo "删除序号无效"
     return 1
   fi
   if [[ ! -f "${NODES_DB}" ]]; then
-    echo "nodes db not found: ${NODES_DB}"
+    echo "节点库不存在: ${NODES_DB}"
     return 1
   fi
   tmp="$(mktemp /tmp/node_del.XXXXXX)"
@@ -281,7 +296,23 @@ delete_nodes_by_csv_indices() {
     }
   ' "${NODES_DB}" > "${tmp}"
   mv -f "${tmp}" "${NODES_DB}"
-  echo "deleted indices: ${csv_indices}"
+  echo "已删除序号: ${csv_indices}"
+  return 0
+}
+
+delete_all_nodes() {
+  local confirm=""
+  if [[ ! -f "${NODES_DB}" ]]; then
+    echo "节点库不存在: ${NODES_DB}"
+    return 1
+  fi
+  read -r -p "确认删除全部节点？输入 YES 确认: " confirm || true
+  if [[ "${confirm}" != "YES" ]]; then
+    echo "已取消"
+    return 1
+  fi
+  : > "${NODES_DB}"
+  echo "全部节点已删除"
   return 0
 }
 
@@ -370,7 +401,7 @@ PY
 show_service_status() {
   local main_state="inactive"
   local file_state="inactive"
-  echo "=== Service Status ==="
+  echo "=== 服务状态 ==="
   if command -v systemctl >/dev/null 2>&1; then
     if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
       main_state="active"
@@ -381,10 +412,10 @@ show_service_status() {
     echo "- ${SERVICE_NAME}: ${main_state}"
     echo "- ${FILE_SERVICE_NAME}: ${file_state}"
   else
-    echo "systemctl not found"
+    echo "未找到 systemctl"
   fi
 
-  echo "=== Listener Ports ==="
+  echo "=== 监听端口 ==="
   if [[ -f "${DEPLOY_TARGET}" ]]; then
     python3 - <<PY
 import json
@@ -396,7 +427,7 @@ except Exception:
     print("config parse failed:", p)
     raise SystemExit(0)
 ports=[str(b.get("port")) for b in c.get("inbounds",[]) if b.get("port")]
-print("configured inbound ports:", ",".join(ports) if ports else "none")
+    print("配置入站端口:", ",".join(ports) if ports else "无")
 PY
   fi
   ss -lnt 2>/dev/null | awk 'NR==1 || /:20[0-9]{3}|:18[0-9]{3}/'
@@ -419,28 +450,38 @@ service_action() {
 }
 
 show_recent_logs() {
-  echo "=== Logs: ${SERVICE_NAME} ==="
+  echo "=== 日志: ${SERVICE_NAME} ==="
   if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -Fxq "${SERVICE_NAME}"; then
     journalctl -u "${SERVICE_NAME}" -n 80 --no-pager || true
   else
-    echo "service log not available, fallback:"
+    echo "服务日志不可用，显示备用日志:"
     tail -n 80 "${STANDALONE_LOG_FILE}" 2>/dev/null || true
   fi
 }
 
 show_qr_bundle_download() {
   local host="${PUBLIC_HOST}"
+  local key=""
   if [[ -z "${host}" ]]; then
     host="$(detect_public_host || true)"
   fi
   if [[ -z "${host}" ]]; then
     host="YOUR_PUBLIC_IP"
   fi
+  if [[ -f "${DOWNLOAD_KEY_FILE}" ]]; then
+    key="$(tr -d '[:space:]' < "${DOWNLOAD_KEY_FILE}" || true)"
+  fi
   if [[ -f "${QR_BUNDLE_ZIP}" ]]; then
-    echo "QR bundle download:"
-    echo "http://${host}:${FILE_HTTP_PORT}/$(basename "${QR_BUNDLE_ZIP}")"
+    echo "二维码压缩包下载页面:"
+    echo "http://${host}:${FILE_HTTP_PORT}/"
+    if [[ -n "${key}" ]]; then
+      echo "下载密钥: ${key}"
+      echo "（可选直链）http://${host}:${FILE_HTTP_PORT}/download?k=${key}"
+    else
+      echo "下载密钥尚未生成"
+    fi
   else
-    echo "QR bundle not found: ${QR_BUNDLE_ZIP}"
+    echo "未找到二维码压缩包: ${QR_BUNDLE_ZIP}"
   fi
 }
 
@@ -452,22 +493,23 @@ interactive_menu() {
   while true; do
     cat <<EOF
 
-======== Xray OneClick Menu ========
-1) Generate / Update Nodes
-2) Show Service Status
-3) Start Services
-4) Restart Services
-5) Stop Services
-6) Show Recent Logs
-7) Show QR Bundle Download Link
-8) Add Nodes (append)
-9) Delete One Node
-10) Delete Batch Nodes
-11) List Nodes DB
-0) Exit
-====================================
+======== Xray OneClick 管理菜单 ========
+1) 生成或更新节点
+2) 查看服务状态
+3) 启动服务
+4) 重启服务
+5) 停止服务
+6) 查看最近日志
+7) 显示二维码压缩包下载信息
+8) 新增节点（追加）
+9) 删除单个节点
+10) 批量删除节点
+11) 查看节点库
+12) 删除全部节点
+0) 退出
+=======================================
 EOF
-    read -r -p "Select: " choice || true
+    read -r -p "请选择: " choice || true
     case "${choice}" in
       1) return 0 ;;
       2) show_service_status ;;
@@ -485,7 +527,7 @@ EOF
         ;;
       9)
         list_nodes_db || true
-        read -r -p "Delete index: " idx || true
+        read -r -p "请输入要删除的序号: " idx || true
         idx="$(echo "${idx}" | tr -d '[:space:]')"
         if [[ "${idx}" =~ ^[0-9]+$ ]]; then
           if delete_nodes_by_csv_indices "${idx}"; then
@@ -494,12 +536,12 @@ EOF
             return 0
           fi
         else
-          echo "invalid index"
+          echo "序号无效"
         fi
         ;;
       10)
         list_nodes_db || true
-        read -r -p "Delete indices (example: 1,3,5-8): " batch || true
+        read -r -p "请输入要删除的序号（示例: 1,3,5-8）: " batch || true
         csv_indices="$(parse_batch_indices_to_csv "${batch}")"
         if delete_nodes_by_csv_indices "${csv_indices}"; then
           INPUT_FILE="${NODES_DB}"
@@ -510,8 +552,15 @@ EOF
       11)
         list_nodes_db || true
         ;;
+      12)
+        if delete_all_nodes; then
+          INPUT_FILE="${NODES_DB}"
+          USE_SAVED_PORT=1
+          return 0
+        fi
+        ;;
       0|q|Q) exit 0 ;;
-      *) echo "invalid selection" ;;
+      *) echo "无效选项" ;;
     esac
   done
 }
@@ -592,6 +641,10 @@ ensure_file_service() {
   if ! command -v systemctl >/dev/null 2>&1; then
     return 1
   fi
+  if [[ ! -f "${QR_SERVER_SCRIPT}" ]]; then
+    echo "WARN: qr server script not found: ${QR_SERVER_SCRIPT}" >&2
+    return 1
+  fi
   cat > "${service_path}" <<EOF
 [Unit]
 Description=Xray OneClick Public Files Service
@@ -599,7 +652,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 -m http.server ${FILE_HTTP_PORT} --directory ${PUBLIC_FILES_DIR}
+ExecStart=/usr/bin/python3 ${QR_SERVER_SCRIPT} --host 0.0.0.0 --port ${FILE_HTTP_PORT} --bundle ${QR_BUNDLE_ZIP} --key-file ${DOWNLOAD_KEY_FILE}
 Restart=always
 RestartSec=2
 User=root
@@ -902,11 +955,14 @@ if [[ "${NO_SERVICE_MODE}" == "1" ]]; then
 fi
 
 if [[ "${AUTO_QR_FILE_SERVER}" == "1" ]] && [[ -f "${QR_BUNDLE_ZIP}" ]]; then
+  generate_download_key
   if ensure_file_service; then
-    echo "QR bundle download:"
-    echo "http://${PUBLIC_HOST}:${FILE_HTTP_PORT}/$(basename "${QR_BUNDLE_ZIP}")"
+    echo "二维码压缩包下载页面:"
+    echo "http://${PUBLIC_HOST}:${FILE_HTTP_PORT}/"
+    echo "下载密钥: ${DOWNLOAD_KEY}"
+    echo "（可选直链）http://${PUBLIC_HOST}:${FILE_HTTP_PORT}/download?k=${DOWNLOAD_KEY}"
   else
-    echo "WARN: failed to start QR file server service ${FILE_SERVICE_NAME}" >&2
+    echo "WARN: 启动二维码下载服务失败: ${FILE_SERVICE_NAME}" >&2
   fi
 fi
 
