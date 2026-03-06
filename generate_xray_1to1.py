@@ -554,6 +554,7 @@ def build_qr_bundle(qr_lines: list[str], bundle_zip_path: Path) -> int:
         return 0
     bundle_zip_path.parent.mkdir(parents=True, exist_ok=True)
     success_count = 0
+    used_stems: dict[str, int] = {}
     with tempfile.TemporaryDirectory(prefix="qr_bundle_") as tmpdir:
         tmpdir_path = Path(tmpdir)
         for i, line in enumerate(qr_lines, start=1):
@@ -561,8 +562,27 @@ def build_qr_bundle(qr_lines: list[str], bundle_zip_path: Path) -> int:
             if len(parts) != 2:
                 continue
             remark_raw, qr_url = parts
-            file_stem = sanitize_remark(remark_raw) or f"node-{i:03d}"
-            file_path = tmpdir_path / f"{i:03d}-{file_stem}.png"
+
+            # Prefer the node remark embedded in the VLESS link itself.
+            file_stem = ""
+            try:
+                parsed_qr = urllib.parse.urlparse(qr_url)
+                query_map = urllib.parse.parse_qs(parsed_qr.query)
+                link_raw = query_map.get("data", [""])[0]
+                if link_raw:
+                    link_parsed = urllib.parse.urlparse(link_raw)
+                    if link_parsed.fragment:
+                        file_stem = sanitize_remark(urllib.parse.unquote(link_parsed.fragment))
+            except Exception:
+                file_stem = ""
+
+            if not file_stem:
+                file_stem = sanitize_remark(remark_raw) or f"node-{i:03d}"
+
+            dup_count = used_stems.get(file_stem, 0) + 1
+            used_stems[file_stem] = dup_count
+            final_stem = file_stem if dup_count == 1 else f"{file_stem}-{dup_count}"
+            file_path = tmpdir_path / f"{final_stem}.png"
             try:
                 with urllib.request.urlopen(qr_url, timeout=8) as resp:
                     content = resp.read()
