@@ -469,18 +469,46 @@ show_recent_logs() {
 show_qr_bundle_download() {
   local host="${PUBLIC_HOST}"
   local key=""
+  local fixed=0
+  local service_state="unknown"
   if [[ -z "${host}" ]]; then
     host="$(detect_public_host || true)"
   fi
   if [[ -z "${host}" ]]; then
     host="YOUR_PUBLIC_IP"
   fi
-  if [[ -f "${DOWNLOAD_KEY_FILE}" ]]; then
-    key="$(tr -d '[:space:]' < "${DOWNLOAD_KEY_FILE}" || true)"
-  fi
   if [[ -f "${QR_BUNDLE_ZIP}" ]]; then
+    if [[ ! -f "${DOWNLOAD_KEY_FILE}" ]]; then
+      echo "检测到下载密钥不存在，正在自动生成..."
+      generate_download_key || true
+    fi
+    if [[ -f "${DOWNLOAD_KEY_FILE}" ]]; then
+      key="$(tr -d '[:space:]' < "${DOWNLOAD_KEY_FILE}" || true)"
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+      if systemctl is-active --quiet "${FILE_SERVICE_NAME}" 2>/dev/null; then
+        service_state="running"
+      else
+        service_state="stopped"
+        echo "检测到 ${FILE_SERVICE_NAME} 未运行，正在自动修复并拉起..."
+        if ensure_file_service; then
+          fixed=1
+          service_state="running"
+        else
+          service_state="failed"
+        fi
+      fi
+    else
+      service_state="no-systemd"
+    fi
+
     echo "二维码压缩包下载页面:"
     echo "http://${host}:${FILE_HTTP_PORT}/"
+    echo "文件服务状态: ${service_state}"
+    if [[ "${fixed}" == "1" ]]; then
+      echo "自动修复结果: 已成功拉起 ${FILE_SERVICE_NAME}"
+    fi
     if [[ -n "${key}" ]]; then
       echo "下载密钥: ${key}"
       echo "（可选直链）http://${host}:${FILE_HTTP_PORT}/download?k=${key}"
