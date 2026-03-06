@@ -37,22 +37,23 @@ download_file() {
   return 1
 }
 
-SCRIPT_PATH="${BASH_SOURCE[0]-}"
-SCRIPT_DIR=""
-if [[ -n "${SCRIPT_PATH}" ]] && [[ -f "${SCRIPT_PATH}" ]]; then
-  SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
-fi
-
-if [[ -n "${SCRIPT_DIR}" ]] && [[ -f "${SCRIPT_DIR}/start_xray_oneclick.sh" && -f "${SCRIPT_DIR}/generate_xray_1to1.py" ]]; then
-  cp "${SCRIPT_DIR}/start_xray_oneclick.sh" "${INSTALL_DIR}/start_xray_oneclick.sh"
-  cp "${SCRIPT_DIR}/generate_xray_1to1.py" "${INSTALL_DIR}/generate_xray_1to1.py"
-elif [[ -n "${RAW_BASE}" ]]; then
+if [[ -n "${RAW_BASE}" ]]; then
   download_file "${RAW_BASE}/start_xray_oneclick.sh" "${INSTALL_DIR}/start_xray_oneclick.sh"
   download_file "${RAW_BASE}/generate_xray_1to1.py" "${INSTALL_DIR}/generate_xray_1to1.py"
 else
-  echo "ERROR: cannot locate scripts locally, and REPO_SLUG is empty." >&2
-  echo "Usage: install.sh <github_user/repo>" >&2
-  exit 1
+  SCRIPT_PATH="${BASH_SOURCE[0]-}"
+  SCRIPT_DIR=""
+  if [[ -n "${SCRIPT_PATH}" ]] && [[ -f "${SCRIPT_PATH}" ]]; then
+    SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
+  fi
+  if [[ -n "${SCRIPT_DIR}" ]] && [[ -f "${SCRIPT_DIR}/start_xray_oneclick.sh" && -f "${SCRIPT_DIR}/generate_xray_1to1.py" ]]; then
+    cp "${SCRIPT_DIR}/start_xray_oneclick.sh" "${INSTALL_DIR}/start_xray_oneclick.sh"
+    cp "${SCRIPT_DIR}/generate_xray_1to1.py" "${INSTALL_DIR}/generate_xray_1to1.py"
+  else
+    echo "ERROR: cannot locate scripts locally, and REPO_SLUG is empty." >&2
+    echo "Usage: install.sh <github_user/repo>" >&2
+    exit 1
+  fi
 fi
 
 chmod +x "${INSTALL_DIR}/start_xray_oneclick.sh" "${INSTALL_DIR}/generate_xray_1to1.py"
