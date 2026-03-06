@@ -37,8 +37,13 @@ download_file() {
   return 1
 }
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ -f "${SCRIPT_DIR}/start_xray_oneclick.sh" && -f "${SCRIPT_DIR}/generate_xray_1to1.py" ]]; then
+SCRIPT_PATH="${BASH_SOURCE[0]-}"
+SCRIPT_DIR=""
+if [[ -n "${SCRIPT_PATH}" ]] && [[ -f "${SCRIPT_PATH}" ]]; then
+  SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
+fi
+
+if [[ -n "${SCRIPT_DIR}" ]] && [[ -f "${SCRIPT_DIR}/start_xray_oneclick.sh" && -f "${SCRIPT_DIR}/generate_xray_1to1.py" ]]; then
   cp "${SCRIPT_DIR}/start_xray_oneclick.sh" "${INSTALL_DIR}/start_xray_oneclick.sh"
   cp "${SCRIPT_DIR}/generate_xray_1to1.py" "${INSTALL_DIR}/generate_xray_1to1.py"
 elif [[ -n "${RAW_BASE}" ]]; then

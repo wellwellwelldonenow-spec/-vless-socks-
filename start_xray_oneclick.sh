@@ -295,6 +295,19 @@ extract_xray_from_zip() {
   mkdir -p "${target_dir}"
 
   if ! command -v unzip >/dev/null 2>&1; then
+    echo "unzip not found, trying to install..."
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get update -y >/dev/null 2>&1 || true
+      apt-get install -y unzip >/dev/null 2>&1 || true
+    elif command -v dnf >/dev/null 2>&1; then
+      dnf install -y unzip >/dev/null 2>&1 || true
+    elif command -v yum >/dev/null 2>&1; then
+      yum install -y unzip >/dev/null 2>&1 || true
+    elif command -v apk >/dev/null 2>&1; then
+      apk add --no-cache unzip >/dev/null 2>&1 || true
+    fi
+  fi
+  if ! command -v unzip >/dev/null 2>&1; then
     echo "ERROR: unzip command not found, cannot extract ${zip_path}" >&2
     return 1
   fi
