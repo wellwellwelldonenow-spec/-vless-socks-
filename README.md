@@ -39,6 +39,72 @@ curl -fsSL https://raw.githubusercontent.com/<你的用户名>/<你的仓库名>
 xray-oneclick
 ```
 
+## GitHub 认证与推送（其他机器）
+
+如果你要在其他机器 `git push` 到本仓库，需要先完成认证。推荐顺序如下：
+
+1. `SSH`（推荐，长期免输密码）
+2. `GitHub CLI 设备码登录`（你提到的 `https://github.com/login/device/select_account`）
+3. `HTTPS + PAT`
+
+### 方式1：SSH（推荐）
+
+```bash
+ssh-keygen -t ed25519 -C "your_email@example.com"
+cat ~/.ssh/id_ed25519.pub
+```
+
+把公钥复制到 GitHub：
+`Settings -> SSH and GPG keys -> New SSH key`
+
+然后测试并切换仓库远程地址：
+
+```bash
+ssh -T git@github.com
+cd /root/xray-oneclick
+git remote set-url origin git@github.com:wellwellwelldonenow-spec/-vless-socks-.git
+git push
+```
+
+### 方式2：GitHub CLI 设备码登录（无需手动输入 PAT）
+
+先安装并登录：
+
+```bash
+gh auth login
+```
+
+按提示选择：
+- `GitHub.com`
+- `HTTPS`
+- `Login with a web browser`
+
+终端会给出一次性设备码，并引导你打开：
+- `https://github.com/login/device`
+- 或 `https://github.com/login/device/select_account`
+
+完成授权后可验证：
+
+```bash
+gh auth status
+cd /root/xray-oneclick
+git push
+```
+
+### 方式3：HTTPS + PAT
+
+把仓库 remote 设为 HTTPS：
+
+```bash
+cd /root/xray-oneclick
+git remote set-url origin https://github.com/wellwellwelldonenow-spec/-vless-socks-.git
+git push
+```
+
+推送时输入：
+- Username: GitHub 用户名
+- Password: PAT（不是 GitHub 登录密码）
+
 卸载并全部清除：
 
 ```bash
