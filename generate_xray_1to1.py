@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import base64
+import concurrent.futures
 import csv
 import datetime
 import ipaddress
@@ -8,7 +9,6 @@ import json
 import re
 import secrets
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
@@ -404,6 +404,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Download all QR PNG files and pack into --qr-bundle-zip",
     )
+    parser.add_argument(
+        "--exit-ip-timeout",
+        type=float,
+        default=6.0,
+        help="Timeout seconds for each SOCKS egress IP probe (default: 6.0)",
+    )
+    parser.add_argument(
+        "--exit-ip-workers",
+        type=int,
+        default=20,
+        help="Concurrent workers for SOCKS egress IP probing (default: 20)",
+    )
     return parser.parse_args()
 
 
@@ -443,18 +455,6 @@ def sanitize_remark(text: str) -> str:
     return text or "node"
 
 
-def resolve_host_to_ip(host: str) -> str:
-    try:
-        ipaddress.ip_address(host)
-        return host
-    except ValueError:
-        pass
-    try:
-        return socket.gethostbyname(host)
-    except OSError:
-        return host
-
-
 def query_country_by_ip(ip_or_host: str) -> str:
     providers = [
         (f"https://ipwho.is/{urllib.parse.quote(ip_or_host)}", "country"),
@@ -472,32 +472,103 @@ def query_country_by_ip(ip_or_host: str) -> str:
     return "Unknown"
 
 
+def detect_exit_ip_via_socks(entry: SocksEntry, timeout_sec: float) -> str:
+    if timeout_sec <= 0:
+        timeout_sec = 6.0
+    curl_bin = shutil.which("curl")
+    if not curl_bin:
+        return ""
+    proxy = f"socks5h://{entry.host}:{entry.port}"
+    auth = f"{entry.username}:{entry.password}"
+    providers = [
+        "https://api64.ipify.org",
+        "https://ifconfig.me/ip",
+        "https://icanhazip.com",
+        "https://ipinfo.io/ip",
+    ]
+    for url in providers:
+        try:
+            proc = subprocess.run(
+                [
+                    curl_bin,
+                    "-4fsS",
+                    "--max-time",
+                    str(timeout_sec),
+                    "--proxy",
+                    proxy,
+                    "--proxy-user",
+                    auth,
+                    url,
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except Exception:
+            continue
+        if proc.returncode != 0:
+            continue
+        text = (proc.stdout or "").strip().splitlines()
+        if not text:
+            continue
+        candidate = text[0].strip()
+        try:
+            ip = ipaddress.ip_address(candidate)
+        except ValueError:
+            continue
+        if ip.version == 4:
+            return str(ip)
+    return ""
+
+
+def detect_exit_ips_for_entries(
+    entries: list[SocksEntry], timeout_sec: float, workers: int
+) -> list[str]:
+    if not entries:
+        return []
+    workers = max(1, min(workers, len(entries), 64))
+    results = [""] * len(entries)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        future_map = {
+            pool.submit(detect_exit_ip_via_socks, entry, timeout_sec): idx
+            for idx, entry in enumerate(entries)
+        }
+        for fut in concurrent.futures.as_completed(future_map):
+            idx = future_map[fut]
+            try:
+                results[idx] = fut.result() or ""
+            except Exception:
+                results[idx] = ""
+    return results
+
+
 def build_share_links(
     mapping: list[dict],
+    entries: list[SocksEntry],
     public_host: str,
     flow: str,
     sni: str,
     fp: str,
     spx: str,
     remark_prefix: str,
+    exit_ip_timeout: float,
+    exit_ip_workers: int,
 ) -> list[str]:
     share_lines = []
     country_cache: dict[str, str] = {}
-    for row in mapping:
-        socks_host = str(row.get("socks_host", "")).strip()
-        display_host = socks_host if socks_host else "unknown-host"
-        try:
-            ipaddress.ip_address(display_host)
-            lookup_target = display_host
-        except ValueError:
-            lookup_target = ""
-
-        if lookup_target:
-            if lookup_target not in country_cache:
-                country_cache[lookup_target] = query_country_by_ip(lookup_target)
-            country = country_cache[lookup_target]
-        else:
-            country = "Unknown"
+    exit_ips = detect_exit_ips_for_entries(
+        entries=entries,
+        timeout_sec=exit_ip_timeout,
+        workers=exit_ip_workers,
+    )
+    for idx, row in enumerate(mapping):
+        exit_ip = exit_ips[idx] if idx < len(exit_ips) else ""
+        if exit_ip and exit_ip not in country_cache:
+            country_cache[exit_ip] = query_country_by_ip(exit_ip)
+        country = country_cache.get(exit_ip, "Unknown") if exit_ip else "Unknown"
+        row["socks_exit_ip"] = exit_ip
+        row["socks_exit_country"] = country
+        display_host = exit_ip if exit_ip else "unknown-exit-ip"
 
         remark = sanitize_remark(f"{display_host}-{country}-{remark_prefix}-{int(row['index']):03d}")
         link = build_vless_link(
@@ -693,19 +764,21 @@ def main() -> int:
 
     output_path = Path(args.output)
     output_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
-    write_mapping_csv(Path(args.mapping), mapping)
     share_lines: list[str] = []
     qr_lines: list[str] = []
     qr_bundle_count = 0
     if args.public_host:
         share_lines = build_share_links(
             mapping=mapping,
+            entries=entries,
             public_host=args.public_host,
             flow=args.flow,
             sni=args.server_name,
             fp=args.fingerprint,
             spx=args.spx,
             remark_prefix=args.remark_prefix,
+            exit_ip_timeout=args.exit_ip_timeout,
+            exit_ip_workers=args.exit_ip_workers,
         )
         qr_lines = build_qr_links(
             vless_lines=share_lines,
@@ -722,6 +795,7 @@ def main() -> int:
                 share_lines=share_lines,
                 links_filename=Path(args.links_file).name,
             )
+    write_mapping_csv(Path(args.mapping), mapping)
 
     try:
         if args.validate:
