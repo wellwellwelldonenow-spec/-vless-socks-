@@ -707,12 +707,18 @@ EOF
 
 ensure_file_service() {
   local service_path="/etc/systemd/system/${FILE_SERVICE_NAME}"
+  local pybin=""
   mkdir -p "${PUBLIC_FILES_DIR}"
   if ! command -v systemctl >/dev/null 2>&1; then
     return 1
   fi
   if [[ ! -f "${QR_SERVER_SCRIPT}" ]]; then
     echo "WARN: qr server script not found: ${QR_SERVER_SCRIPT}" >&2
+    return 1
+  fi
+  pybin="$(command -v python3 || true)"
+  if [[ -z "${pybin}" ]]; then
+    echo "WARN: python3 not found, cannot start file service" >&2
     return 1
   fi
   cat > "${service_path}" <<EOF
@@ -722,7 +728,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 ${QR_SERVER_SCRIPT} --host 0.0.0.0 --port ${FILE_HTTP_PORT} --bundle ${QR_BUNDLE_ZIP} --key-file ${DOWNLOAD_KEY_FILE}
+ExecStart=${pybin} ${QR_SERVER_SCRIPT} --host 0.0.0.0 --port ${FILE_HTTP_PORT} --bundle ${QR_BUNDLE_ZIP} --key-file ${DOWNLOAD_KEY_FILE}
 Restart=always
 RestartSec=2
 User=root
