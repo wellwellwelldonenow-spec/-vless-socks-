@@ -42,10 +42,13 @@ SERVICE_NAME="${SERVICE_NAME:-xray-oneclick.service}"
 PUBLIC_FILES_DIR="${PUBLIC_FILES_DIR:-/opt/xray-oneclick/public}"
 QR_BUNDLE_ZIP="${QR_BUNDLE_ZIP:-${PUBLIC_FILES_DIR}/qr_bundle.zip}"
 FILE_HTTP_PORT="${FILE_HTTP_PORT:-18089}"
+FILE_HTTP_PORT_FILE="${FILE_HTTP_PORT_FILE:-/opt/xray-oneclick/file_http_port}"
 FILE_SERVICE_NAME="${FILE_SERVICE_NAME:-xray-oneclick-files.service}"
 AUTO_QR_FILE_SERVER="${AUTO_QR_FILE_SERVER:-1}"
 DOWNLOAD_KEY_FILE="${DOWNLOAD_KEY_FILE:-${PUBLIC_FILES_DIR}/download.key}"
 QR_SERVER_SCRIPT="${QR_SERVER_SCRIPT:-${BASE_DIR}/qr_download_server.py}"
+FILE_STANDALONE_PID_FILE="${FILE_STANDALONE_PID_FILE:-/tmp/xray-oneclick-files.pid}"
+FILE_STANDALONE_LOG_FILE="${FILE_STANDALONE_LOG_FILE:-/tmp/xray-oneclick-files.log}"
 MENU_ENABLED="${MENU_ENABLED:-1}"
 NODES_DB="${NODES_DB:-/opt/xray-oneclick/nodes.csv}"
 START_PORT_FILE="${START_PORT_FILE:-/opt/xray-oneclick/start_port}"
@@ -91,6 +94,7 @@ Key env vars:
   SERVICE_NAME      managed systemd unit name (default: xray-oneclick.service)
   AUTO_QR_FILE_SERVER auto-start file server for QR bundle zip (1/0, default: 1)
   FILE_HTTP_PORT    file server port for QR bundle download (default: 18089)
+  FILE_HTTP_PORT_FILE persist file server port (default: /opt/xray-oneclick/file_http_port)
   DOWNLOAD_KEY_FILE download key file path for QR bundle (default: /opt/xray-oneclick/public/download.key)
   MENU_ENABLED      show interactive management menu in TTY mode (1/0, default: 1)
   NODES_DB          node source file for management menu (default: /opt/xray-oneclick/nodes.csv)
@@ -171,6 +175,11 @@ save_start_port() {
   echo "${START_PORT}" > "${START_PORT_FILE}"
 }
 
+save_file_http_port() {
+  ensure_nodes_db_dir
+  echo "${FILE_HTTP_PORT}" > "${FILE_HTTP_PORT_FILE}"
+}
+
 load_saved_start_port() {
   if [[ -f "${START_PORT_FILE}" ]]; then
     local saved=""
@@ -178,6 +187,18 @@ load_saved_start_port() {
     if [[ "${saved}" =~ ^[0-9]+$ ]] && (( saved >= 1 && saved <= 65535 )); then
       START_PORT="${saved}"
       echo "使用已保存 START_PORT=${START_PORT}"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+load_saved_file_http_port() {
+  if [[ -f "${FILE_HTTP_PORT_FILE}" ]]; then
+    local saved=""
+    saved="$(tr -d '[:space:]' < "${FILE_HTTP_PORT_FILE}" || true)"
+    if [[ "${saved}" =~ ^[0-9]+$ ]] && (( saved >= 1 && saved <= 65535 )); then
+      FILE_HTTP_PORT="${saved}"
       return 0
     fi
   fi
@@ -405,6 +426,154 @@ PY
   return 1
 }
 
+is_port_listening() {
+  local port="$1"
+  ss -lnt 2>/dev/null | awk 'NR>1 {print $4}' | grep -Eq ":${port}$"
+}
+
+find_free_file_http_port() {
+  local from_port="${1:-18089}"
+  local used=""
+  local p=0
+  if [[ ! "${from_port}" =~ ^[0-9]+$ ]] || (( from_port < 1 || from_port > 65535 )); then
+    from_port=18089
+  fi
+  used="$(collect_used_ports | tr '\n' ' ')"
+  for ((p=from_port; p<=65535; p++)); do
+    if [[ " ${used} " != *" ${p} "* ]]; then
+      echo "${p}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+qr_download_local_healthcheck() {
+  local body=""
+  local url="http://127.0.0.1:${FILE_HTTP_PORT}/"
+  if command -v curl >/dev/null 2>&1; then
+    body="$(curl -fsS --max-time 4 "${url}" 2>/dev/null || true)"
+  elif command -v wget >/dev/null 2>&1; then
+    body="$(wget -qO- --timeout=4 "${url}" 2>/dev/null || true)"
+  elif command -v python3 >/dev/null 2>&1; then
+    body="$(python3 - <<PY 2>/dev/null || true
+import urllib.request
+url = "${url}"
+with urllib.request.urlopen(url, timeout=4) as r:
+    print(r.read().decode("utf-8", "ignore"))
+PY
+)"
+  fi
+  if [[ "${body}" == *"二维码压缩包下载"* ]] || [[ "${body}" == *"QR Bundle Download"* ]]; then
+    return 0
+  fi
+  return 1
+}
+
+stop_standalone_file_server() {
+  local pid=""
+  if [[ -f "${FILE_STANDALONE_PID_FILE}" ]]; then
+    pid="$(cat "${FILE_STANDALONE_PID_FILE}" 2>/dev/null || true)"
+    if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+      kill "${pid}" >/dev/null 2>&1 || true
+      sleep 0.3
+      kill -9 "${pid}" >/dev/null 2>&1 || true
+    fi
+  fi
+  pkill -f "${QR_SERVER_SCRIPT} --host 0.0.0.0 --port" >/dev/null 2>&1 || true
+  rm -f "${FILE_STANDALONE_PID_FILE}" >/dev/null 2>&1 || true
+}
+
+start_standalone_file_server() {
+  local pybin=""
+  pybin="$(command -v python3 || true)"
+  if [[ -z "${pybin}" ]]; then
+    echo "WARN: python3 not found, cannot start standalone file server" >&2
+    return 1
+  fi
+  if [[ ! -f "${QR_SERVER_SCRIPT}" ]]; then
+    echo "WARN: qr server script not found: ${QR_SERVER_SCRIPT}" >&2
+    return 1
+  fi
+  mkdir -p "$(dirname "${FILE_STANDALONE_PID_FILE}")" "$(dirname "${FILE_STANDALONE_LOG_FILE}")"
+  stop_standalone_file_server
+  nohup "${pybin}" "${QR_SERVER_SCRIPT}" --host 0.0.0.0 --port "${FILE_HTTP_PORT}" --bundle "${QR_BUNDLE_ZIP}" --key-file "${DOWNLOAD_KEY_FILE}" >> "${FILE_STANDALONE_LOG_FILE}" 2>&1 &
+  echo $! > "${FILE_STANDALONE_PID_FILE}"
+  sleep 0.8
+  if ! kill -0 "$(cat "${FILE_STANDALONE_PID_FILE}")" 2>/dev/null; then
+    return 1
+  fi
+  return 0
+}
+
+ensure_firewall_port_open() {
+  local port="$1"
+  if command -v ufw >/dev/null 2>&1; then
+    if ufw status 2>/dev/null | grep -qi "Status: active"; then
+      ufw allow "${port}/tcp" >/dev/null 2>&1 || true
+    fi
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1; then
+    if firewall-cmd --state >/dev/null 2>&1; then
+      firewall-cmd --quiet --add-port="${port}/tcp" --permanent >/dev/null 2>&1 || true
+      firewall-cmd --quiet --reload >/dev/null 2>&1 || true
+    fi
+  fi
+}
+
+ensure_qr_download_healthy() {
+  local i=0
+  local new_port=""
+
+  if [[ ! -f "${QR_BUNDLE_ZIP}" ]]; then
+    echo "未找到二维码压缩包: ${QR_BUNDLE_ZIP}" >&2
+    return 1
+  fi
+
+  if [[ ! -f "${DOWNLOAD_KEY_FILE}" ]]; then
+    generate_download_key || true
+  fi
+
+  for i in 1 2 3; do
+    if command -v systemctl >/dev/null 2>&1; then
+      if ensure_file_service; then
+        sleep 0.4
+        if qr_download_local_healthcheck; then
+          ensure_firewall_port_open "${FILE_HTTP_PORT}"
+          save_file_http_port
+          return 0
+        fi
+        systemctl restart "${FILE_SERVICE_NAME}" >/dev/null 2>&1 || true
+        sleep 0.6
+        if qr_download_local_healthcheck; then
+          ensure_firewall_port_open "${FILE_HTTP_PORT}"
+          save_file_http_port
+          return 0
+        fi
+      fi
+    fi
+
+    if start_standalone_file_server; then
+      if qr_download_local_healthcheck; then
+        ensure_firewall_port_open "${FILE_HTTP_PORT}"
+        save_file_http_port
+        return 0
+      fi
+    fi
+
+    if is_port_listening "${FILE_HTTP_PORT}" && ! qr_download_local_healthcheck; then
+      new_port="$(find_free_file_http_port $((FILE_HTTP_PORT + 1)) || true)"
+      if [[ -n "${new_port}" ]]; then
+        echo "检测到下载端口 ${FILE_HTTP_PORT} 被异常占用，自动切换到 ${new_port}"
+        FILE_HTTP_PORT="${new_port}"
+        continue
+      fi
+    fi
+  done
+
+  return 1
+}
+
 show_service_status() {
   local main_state="inactive"
   local file_state="inactive"
@@ -423,6 +592,13 @@ show_service_status() {
   fi
 
   echo "=== 监听端口 ==="
+  load_saved_file_http_port || true
+  echo "二维码下载端口: ${FILE_HTTP_PORT}"
+  if qr_download_local_healthcheck; then
+    echo "二维码下载本机检测: ok"
+  else
+    echo "二维码下载本机检测: fail"
+  fi
   if [[ -f "${DEPLOY_TARGET}" ]]; then
     python3 - <<PY
 import json
@@ -454,6 +630,9 @@ service_action() {
   if systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -Fxq "${FILE_SERVICE_NAME}"; then
     systemctl "${action}" "${FILE_SERVICE_NAME}" || true
   fi
+  if [[ "${action}" == "stop" ]]; then
+    stop_standalone_file_server || true
+  fi
 }
 
 show_recent_logs() {
@@ -469,8 +648,8 @@ show_recent_logs() {
 show_qr_bundle_download() {
   local host="${PUBLIC_HOST}"
   local key=""
-  local fixed=0
   local service_state="unknown"
+  local local_health="fail"
   if [[ -z "${host}" ]]; then
     host="$(detect_public_host || true)"
   fi
@@ -478,42 +657,33 @@ show_qr_bundle_download() {
     host="YOUR_PUBLIC_IP"
   fi
   if [[ -f "${QR_BUNDLE_ZIP}" ]]; then
-    if [[ ! -f "${DOWNLOAD_KEY_FILE}" ]]; then
-      echo "检测到下载密钥不存在，正在自动生成..."
-      generate_download_key || true
+    load_saved_file_http_port || true
+    echo "开始自检二维码下载服务..."
+    if ensure_qr_download_healthy; then
+      service_state="running"
+      local_health="ok"
+    else
+      service_state="failed"
+      local_health="fail"
     fi
     if [[ -f "${DOWNLOAD_KEY_FILE}" ]]; then
       key="$(tr -d '[:space:]' < "${DOWNLOAD_KEY_FILE}" || true)"
     fi
 
-    if command -v systemctl >/dev/null 2>&1; then
-      if systemctl is-active --quiet "${FILE_SERVICE_NAME}" 2>/dev/null; then
-        service_state="running"
-      else
-        service_state="stopped"
-        echo "检测到 ${FILE_SERVICE_NAME} 未运行，正在自动修复并拉起..."
-        if ensure_file_service; then
-          fixed=1
-          service_state="running"
-        else
-          service_state="failed"
-        fi
-      fi
-    else
-      service_state="no-systemd"
-    fi
-
     echo "二维码压缩包下载页面:"
     echo "http://${host}:${FILE_HTTP_PORT}/"
     echo "文件服务状态: ${service_state}"
-    if [[ "${fixed}" == "1" ]]; then
-      echo "自动修复结果: 已成功拉起 ${FILE_SERVICE_NAME}"
-    fi
+    echo "本机健康检查: ${local_health}"
     if [[ -n "${key}" ]]; then
       echo "下载密钥: ${key}"
       echo "（可选直链）http://${host}:${FILE_HTTP_PORT}/download?k=${key}"
     else
       echo "下载密钥尚未生成"
+    fi
+    if [[ "${local_health}" != "ok" ]]; then
+      echo "诊断建议: 执行 journalctl -u ${FILE_SERVICE_NAME} -n 80 --no-pager 查看错误日志"
+    else
+      echo "如果外网仍 502：通常是反代/CDN/安全组问题，先用公网IP直连测试。"
     fi
   else
     echo "未找到二维码压缩包: ${QR_BUNDLE_ZIP}"
@@ -555,10 +725,11 @@ uninstall_everything() {
     fi
   fi
   pkill -f "xray.*run -c ${DEPLOY_TARGET}" >/dev/null 2>&1 || true
+  stop_standalone_file_server || true
 
-  rm -f "${STANDALONE_PID_FILE}" "${STANDALONE_LOG_FILE}" >/dev/null 2>&1 || true
+  rm -f "${STANDALONE_PID_FILE}" "${STANDALONE_LOG_FILE}" "${FILE_STANDALONE_PID_FILE}" "${FILE_STANDALONE_LOG_FILE}" >/dev/null 2>&1 || true
   rm -f "${DEPLOY_TARGET}" >/dev/null 2>&1 || true
-  rm -f "${NODES_DB}" "${START_PORT_FILE}" "${DOWNLOAD_KEY_FILE}" >/dev/null 2>&1 || true
+  rm -f "${NODES_DB}" "${START_PORT_FILE}" "${FILE_HTTP_PORT_FILE}" "${DOWNLOAD_KEY_FILE}" >/dev/null 2>&1 || true
   rm -rf "${PUBLIC_FILES_DIR}" >/dev/null 2>&1 || true
 
   for candidate in /usr/local/bin/xray-oneclick /usr/local/bin/xray-oneclick-uninstall "$HOME/.local/bin/xray-oneclick" "$HOME/.local/bin/xray-oneclick-uninstall"; do
@@ -983,6 +1154,8 @@ if [[ -n "${INPUT_FILE}" && ! -f "${INPUT_FILE}" ]]; then
   exit 1
 fi
 
+load_saved_file_http_port || true
+
 if [[ -t 0 && -z "${INPUT_FILE}" && "${MENU_ENABLED}" == "1" ]]; then
   interactive_menu
 fi
@@ -1131,14 +1304,25 @@ if [[ "${NO_SERVICE_MODE}" == "1" ]]; then
 fi
 
 if [[ "${AUTO_QR_FILE_SERVER}" == "1" ]] && [[ -f "${QR_BUNDLE_ZIP}" ]]; then
-  generate_download_key
-  if ensure_file_service; then
+  if ensure_qr_download_healthy; then
+    if [[ -f "${DOWNLOAD_KEY_FILE}" ]]; then
+      DOWNLOAD_KEY="$(tr -d '[:space:]' < "${DOWNLOAD_KEY_FILE}" || true)"
+    fi
     echo "二维码压缩包下载页面:"
     echo "http://${PUBLIC_HOST}:${FILE_HTTP_PORT}/"
-    echo "下载密钥: ${DOWNLOAD_KEY}"
-    echo "（可选直链）http://${PUBLIC_HOST}:${FILE_HTTP_PORT}/download?k=${DOWNLOAD_KEY}"
+    if [[ -n "${DOWNLOAD_KEY}" ]]; then
+      echo "下载密钥: ${DOWNLOAD_KEY}"
+      echo "（可选直链）http://${PUBLIC_HOST}:${FILE_HTTP_PORT}/download?k=${DOWNLOAD_KEY}"
+    else
+      echo "下载密钥尚未生成"
+    fi
   else
     echo "WARN: 启动二维码下载服务失败: ${FILE_SERVICE_NAME}" >&2
+    if command -v systemctl >/dev/null 2>&1; then
+      echo "Hint: journalctl -u ${FILE_SERVICE_NAME} -n 80 --no-pager" >&2
+    else
+      echo "Hint: tail -n 80 ${FILE_STANDALONE_LOG_FILE}" >&2
+    fi
   fi
 fi
 
