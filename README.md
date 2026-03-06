@@ -8,7 +8,8 @@
 - 自动生成 N 组 1:1 映射（入站与出站不串线）
 - 自动生成 `UUID`、`shortId`、Reality key
 - 自动校验配置并部署
-- 自动输出 `v2rayN` / `Shadowrocket` 链接到终端
+- 自动输出一份通用 `vless://` 节点链接到终端
+- 二维码压缩包内自动包含 `links.txt`（全部节点链接）
 - 自动探测公网 IP
 - 缺少 xray 时自动安装（优先本地 zip）
 

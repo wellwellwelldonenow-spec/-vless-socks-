@@ -359,14 +359,9 @@ def parse_args() -> argparse.Namespace:
         help="Share-link remark prefix (default: node)",
     )
     parser.add_argument(
-        "--v2rayn-links",
-        default="v2rayn_links.txt",
-        help="Output v2rayN links file (default: v2rayn_links.txt)",
-    )
-    parser.add_argument(
-        "--shadowrocket-links",
-        default="shadowrocket_links.txt",
-        help="Output Shadowrocket links file (default: shadowrocket_links.txt)",
+        "--links-file",
+        default="links.txt",
+        help="Output unified VLESS links file (default: links.txt)",
     )
     parser.add_argument(
         "--no-link-files",
@@ -485,9 +480,8 @@ def build_share_links(
     fp: str,
     spx: str,
     remark_prefix: str,
-) -> tuple[list[str], list[str]]:
-    v2rayn_lines = []
-    shadowrocket_lines = []
+) -> list[str]:
+    share_lines = []
     country_cache: dict[str, str] = {}
     for row in mapping:
         socks_host = str(row.get("socks_host", "")).strip()
@@ -518,14 +512,12 @@ def build_share_links(
             spx=spx,
             remark=remark,
         )
-        v2rayn_lines.append(link)
-        shadowrocket_lines.append(link)
-    return v2rayn_lines, shadowrocket_lines
+        share_lines.append(link)
+    return share_lines
 
 
-def write_share_links(v2rayn_file: Path, shadowrocket_file: Path, v2rayn_lines: list[str], shadowrocket_lines: list[str]) -> None:
-    v2rayn_file.write_text("\n".join(v2rayn_lines) + "\n", encoding="utf-8")
-    shadowrocket_file.write_text("\n".join(shadowrocket_lines) + "\n", encoding="utf-8")
+def write_share_links(links_file: Path, share_lines: list[str]) -> None:
+    links_file.write_text("\n".join(share_lines) + "\n", encoding="utf-8")
 
 
 def build_qr_links(vless_lines: list[str], qr_api_base: str, qr_size: int) -> list[str]:
@@ -549,7 +541,12 @@ def write_qr_links(path: Path, qr_lines: list[str]) -> None:
     path.write_text("\n".join(qr_lines) + "\n", encoding="utf-8")
 
 
-def build_qr_bundle(qr_lines: list[str], bundle_zip_path: Path) -> int:
+def build_qr_bundle(
+    qr_lines: list[str],
+    bundle_zip_path: Path,
+    share_lines: list[str] | None = None,
+    links_filename: str = "links.txt",
+) -> int:
     if not qr_lines:
         return 0
     bundle_zip_path.parent.mkdir(parents=True, exist_ok=True)
@@ -593,9 +590,18 @@ def build_qr_bundle(qr_lines: list[str], bundle_zip_path: Path) -> int:
             except Exception:
                 continue
 
+        if share_lines:
+            links_name = sanitize_remark(links_filename).replace("-", "_")
+            if not links_name.lower().endswith(".txt"):
+                links_name = f"{links_name}.txt"
+            links_path = tmpdir_path / links_name
+            links_path.write_text("\n".join(share_lines) + "\n", encoding="utf-8")
+
         with zipfile.ZipFile(bundle_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             for png_file in sorted(tmpdir_path.glob("*.png")):
                 zf.write(png_file, arcname=png_file.name)
+            if share_lines:
+                zf.write(links_path, arcname=links_path.name)
     return success_count
 
 
@@ -688,12 +694,11 @@ def main() -> int:
     output_path = Path(args.output)
     output_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
     write_mapping_csv(Path(args.mapping), mapping)
-    v2rayn_lines: list[str] = []
-    shadowrocket_lines: list[str] = []
+    share_lines: list[str] = []
     qr_lines: list[str] = []
     qr_bundle_count = 0
     if args.public_host:
-        v2rayn_lines, shadowrocket_lines = build_share_links(
+        share_lines = build_share_links(
             mapping=mapping,
             public_host=args.public_host,
             flow=args.flow,
@@ -703,20 +708,20 @@ def main() -> int:
             remark_prefix=args.remark_prefix,
         )
         qr_lines = build_qr_links(
-            vless_lines=v2rayn_lines,
+            vless_lines=share_lines,
             qr_api_base=args.qr_api_base,
             qr_size=args.qr_size,
         )
         if not args.no_link_files:
-            write_share_links(
-                v2rayn_file=Path(args.v2rayn_links),
-                shadowrocket_file=Path(args.shadowrocket_links),
-                v2rayn_lines=v2rayn_lines,
-                shadowrocket_lines=shadowrocket_lines,
-            )
+            write_share_links(links_file=Path(args.links_file), share_lines=share_lines)
             write_qr_links(Path(args.qr_links), qr_lines)
         if args.build_qr_bundle:
-            qr_bundle_count = build_qr_bundle(qr_lines, Path(args.qr_bundle_zip))
+            qr_bundle_count = build_qr_bundle(
+                qr_lines=qr_lines,
+                bundle_zip_path=Path(args.qr_bundle_zip),
+                share_lines=share_lines,
+                links_filename=Path(args.links_file).name,
+            )
 
     try:
         if args.validate:
@@ -739,17 +744,13 @@ def main() -> int:
     print(f"generated: {args.mapping}")
     if args.public_host:
         if not args.no_link_files:
-            print(f"generated: {args.v2rayn_links}")
-            print(f"generated: {args.shadowrocket_links}")
+            print(f"generated: {args.links_file}")
             print(f"generated: {args.qr_links}")
         if args.build_qr_bundle:
-            print(f"generated: {args.qr_bundle_zip} ({qr_bundle_count} png)")
+            print(f"generated: {args.qr_bundle_zip} ({qr_bundle_count} png + {Path(args.links_file).name})")
         if args.print_links:
-            print("=== v2rayN links ===")
-            for link in v2rayn_lines:
-                print(link)
-            print("=== Shadowrocket links ===")
-            for link in shadowrocket_lines:
+            print("=== unified vless links ===")
+            for link in share_lines:
                 print(link)
         if args.print_qr:
             print("=== QR PNG public links ===")
