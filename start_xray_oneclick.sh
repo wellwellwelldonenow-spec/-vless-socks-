@@ -45,6 +45,9 @@ FILE_HTTP_PORT="${FILE_HTTP_PORT:-18089}"
 FILE_SERVICE_NAME="${FILE_SERVICE_NAME:-xray-oneclick-files.service}"
 AUTO_QR_FILE_SERVER="${AUTO_QR_FILE_SERVER:-1}"
 MENU_ENABLED="${MENU_ENABLED:-1}"
+NODES_DB="${NODES_DB:-/opt/xray-oneclick/nodes.csv}"
+START_PORT_FILE="${START_PORT_FILE:-/opt/xray-oneclick/start_port}"
+USE_SAVED_PORT=0
 NO_SERVICE_MODE=0
 
 usage() {
@@ -83,6 +86,7 @@ Key env vars:
   AUTO_QR_FILE_SERVER auto-start file server for QR bundle zip (1/0, default: 1)
   FILE_HTTP_PORT    file server port for QR bundle download (default: 18089)
   MENU_ENABLED      show interactive management menu in TTY mode (1/0, default: 1)
+  NODES_DB          node source file for management menu (default: /opt/xray-oneclick/nodes.csv)
 EOF
 }
 
@@ -125,6 +129,41 @@ collect_stdin_input() {
   INPUT_FILE="${INPUT_TMP}"
 }
 
+ensure_nodes_db_dir() {
+  mkdir -p "$(dirname "${NODES_DB}")"
+}
+
+persist_nodes_db_from_input() {
+  local src="$1"
+  local tmp=""
+  ensure_nodes_db_dir
+  tmp="$(mktemp /tmp/nodes_db.XXXXXX)"
+  awk '
+    /^[[:space:]]*$/ {next}
+    /^[[:space:]]*#/ {next}
+    {print}
+  ' "${src}" > "${tmp}"
+  mv -f "${tmp}" "${NODES_DB}"
+}
+
+save_start_port() {
+  ensure_nodes_db_dir
+  echo "${START_PORT}" > "${START_PORT_FILE}"
+}
+
+load_saved_start_port() {
+  if [[ -f "${START_PORT_FILE}" ]]; then
+    local saved=""
+    saved="$(tr -d '[:space:]' < "${START_PORT_FILE}" || true)"
+    if [[ "${saved}" =~ ^[0-9]+$ ]] && (( saved >= 1 && saved <= 65535 )); then
+      START_PORT="${saved}"
+      echo "using saved START_PORT=${START_PORT}"
+      return 0
+    fi
+  fi
+  return 1
+}
+
 prompt_start_port() {
   local input=""
   while true; do
@@ -140,6 +179,110 @@ prompt_start_port() {
     echo "Invalid port. Please enter 1-65535."
   done
   echo "using START_PORT=${START_PORT}"
+}
+
+list_nodes_db() {
+  if [[ ! -f "${NODES_DB}" ]]; then
+    echo "nodes db not found: ${NODES_DB}"
+    return 1
+  fi
+  awk '
+    /^[[:space:]]*$/ {next}
+    /^[[:space:]]*#/ {next}
+    {print ++n ". " $0}
+    END{if(n==0) print "no nodes"}
+  ' "${NODES_DB}"
+}
+
+collect_nodes_append_to_db() {
+  local tmp=""
+  local line=""
+  local normalized=""
+  local blank_count=0
+  local data_count=0
+  tmp="$(mktemp /tmp/node_add.XXXXXX)"
+  echo "Paste SOCKS lines to add (host:port:user:pass)"
+  echo "Finish with: end / END / 结束 / double Enter / Ctrl+D"
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    normalized="$(echo "${line}" | tr -d '[:space:]')"
+    if [[ "${normalized}" == "end" || "${normalized}" == "END" || "${normalized}" == "结束" ]]; then
+      break
+    fi
+    if [[ -z "${normalized}" ]]; then
+      if (( data_count > 0 )); then
+        ((blank_count += 1))
+        if (( blank_count >= 2 )); then
+          break
+        fi
+      fi
+      continue
+    fi
+    blank_count=0
+    ((data_count += 1))
+    echo "${line}" >> "${tmp}"
+  done
+  if (( data_count == 0 )); then
+    rm -f "${tmp}"
+    echo "no lines added"
+    return 1
+  fi
+  ensure_nodes_db_dir
+  touch "${NODES_DB}"
+  cat "${tmp}" >> "${NODES_DB}"
+  rm -f "${tmp}"
+  echo "nodes appended into ${NODES_DB}"
+  return 0
+}
+
+parse_batch_indices_to_csv() {
+  local raw="$1"
+  python3 - <<PY
+raw = """${raw}"""
+parts = [p.strip() for p in raw.replace(" ", "").split(",") if p.strip()]
+nums = set()
+for p in parts:
+    if "-" in p:
+        a, b = p.split("-", 1)
+        if a.isdigit() and b.isdigit():
+            x, y = int(a), int(b)
+            if x > y:
+                x, y = y, x
+            for i in range(x, y + 1):
+                nums.add(i)
+    elif p.isdigit():
+        nums.add(int(p))
+vals = [str(x) for x in sorted(n for n in nums if n > 0)]
+print(",".join(vals))
+PY
+}
+
+delete_nodes_by_csv_indices() {
+  local csv_indices="$1"
+  local tmp=""
+  if [[ -z "${csv_indices}" ]]; then
+    echo "no valid indices"
+    return 1
+  fi
+  if [[ ! -f "${NODES_DB}" ]]; then
+    echo "nodes db not found: ${NODES_DB}"
+    return 1
+  fi
+  tmp="$(mktemp /tmp/node_del.XXXXXX)"
+  awk -v dels="${csv_indices}" '
+    BEGIN {
+      split(dels, a, ",")
+      for (i in a) del[a[i]] = 1
+    }
+    /^[[:space:]]*$/ {next}
+    /^[[:space:]]*#/ {next}
+    {
+      n++
+      if (!(n in del)) print $0
+    }
+  ' "${NODES_DB}" > "${tmp}"
+  mv -f "${tmp}" "${NODES_DB}"
+  echo "deleted indices: ${csv_indices}"
+  return 0
 }
 
 is_ipv4() {
@@ -303,6 +446,9 @@ show_qr_bundle_download() {
 
 interactive_menu() {
   local choice=""
+  local idx=""
+  local batch=""
+  local csv_indices=""
   while true; do
     cat <<EOF
 
@@ -314,6 +460,10 @@ interactive_menu() {
 5) Stop Services
 6) Show Recent Logs
 7) Show QR Bundle Download Link
+8) Add Nodes (append)
+9) Delete One Node
+10) Delete Batch Nodes
+11) List Nodes DB
 0) Exit
 ====================================
 EOF
@@ -326,6 +476,40 @@ EOF
       5) service_action stop ;;
       6) show_recent_logs ;;
       7) show_qr_bundle_download ;;
+      8)
+        if collect_nodes_append_to_db; then
+          INPUT_FILE="${NODES_DB}"
+          USE_SAVED_PORT=1
+          return 0
+        fi
+        ;;
+      9)
+        list_nodes_db || true
+        read -r -p "Delete index: " idx || true
+        idx="$(echo "${idx}" | tr -d '[:space:]')"
+        if [[ "${idx}" =~ ^[0-9]+$ ]]; then
+          if delete_nodes_by_csv_indices "${idx}"; then
+            INPUT_FILE="${NODES_DB}"
+            USE_SAVED_PORT=1
+            return 0
+          fi
+        else
+          echo "invalid index"
+        fi
+        ;;
+      10)
+        list_nodes_db || true
+        read -r -p "Delete indices (example: 1,3,5-8): " batch || true
+        csv_indices="$(parse_batch_indices_to_csv "${batch}")"
+        if delete_nodes_by_csv_indices "${csv_indices}"; then
+          INPUT_FILE="${NODES_DB}"
+          USE_SAVED_PORT=1
+          return 0
+        fi
+        ;;
+      11)
+        list_nodes_db || true
+        ;;
       0|q|Q) exit 0 ;;
       *) echo "invalid selection" ;;
     esac
@@ -595,7 +779,9 @@ if [[ -t 0 && -z "${INPUT_FILE}" && "${MENU_ENABLED}" == "1" ]]; then
   interactive_menu
 fi
 
-if [[ -t 0 ]]; then
+if [[ "${USE_SAVED_PORT}" == "1" ]]; then
+  load_saved_start_port || prompt_start_port
+elif [[ -t 0 ]]; then
   prompt_start_port
 fi
 
@@ -696,6 +882,11 @@ if [[ -n "${INPUT_FILE}" ]]; then
   python3 "${GEN_SCRIPT}" "${ARGS[@]}"
 else
   python3 "${GEN_SCRIPT}" "${ARGS[@]}"
+fi
+
+if [[ -n "${INPUT_FILE}" ]]; then
+  persist_nodes_db_from_input "${INPUT_FILE}"
+  save_start_port
 fi
 
 if [[ "${NO_SERVICE_MODE}" == "1" ]]; then
