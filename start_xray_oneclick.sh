@@ -340,7 +340,14 @@ delete_all_nodes() {
     return 1
   fi
   : > "${NODES_DB}"
+  rm -f "${DEPLOY_TARGET}" >/dev/null 2>&1 || true
+  stop_standalone_xray || true
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop "${SERVICE_NAME}" >/dev/null 2>&1 || true
+    systemctl stop "${FILE_SERVICE_NAME}" >/dev/null 2>&1 || true
+  fi
   echo "全部节点已删除"
+  echo "已停止服务并清理部署配置，入站端口监听应已关闭。"
   return 0
 }
 
@@ -796,6 +803,15 @@ EOF
         idx="$(echo "${idx}" | tr -d '[:space:]')"
         if [[ "${idx}" =~ ^[0-9]+$ ]]; then
           if delete_nodes_by_csv_indices "${idx}"; then
+            if [[ "$(count_input_lines "${NODES_DB}")" -le 0 ]]; then
+              rm -f "${DEPLOY_TARGET}" >/dev/null 2>&1 || true
+              stop_standalone_xray || true
+              if command -v systemctl >/dev/null 2>&1; then
+                systemctl stop "${SERVICE_NAME}" >/dev/null 2>&1 || true
+              fi
+              echo "节点已全部删除，服务已停止。"
+              continue
+            fi
             INPUT_FILE="${NODES_DB}"
             USE_SAVED_PORT=1
             return 0
@@ -809,6 +825,15 @@ EOF
         read -r -p "请输入要删除的序号（示例: 1,3,5-8）: " batch || true
         csv_indices="$(parse_batch_indices_to_csv "${batch}")"
         if delete_nodes_by_csv_indices "${csv_indices}"; then
+          if [[ "$(count_input_lines "${NODES_DB}")" -le 0 ]]; then
+            rm -f "${DEPLOY_TARGET}" >/dev/null 2>&1 || true
+            stop_standalone_xray || true
+            if command -v systemctl >/dev/null 2>&1; then
+              systemctl stop "${SERVICE_NAME}" >/dev/null 2>&1 || true
+            fi
+            echo "节点已全部删除，服务已停止。"
+            continue
+          fi
           INPUT_FILE="${NODES_DB}"
           USE_SAVED_PORT=1
           return 0
@@ -819,9 +844,7 @@ EOF
         ;;
       12)
         if delete_all_nodes; then
-          INPUT_FILE="${NODES_DB}"
-          USE_SAVED_PORT=1
-          return 0
+          continue
         fi
         ;;
       13)
@@ -1031,11 +1054,34 @@ collect_used_ports() {
   ss -lnt 2>/dev/null | awk 'NR>1 {split($4,a,":"); p=a[length(a)]; if (p ~ /^[0-9]+$/) print p}' | sort -n | uniq
 }
 
+collect_current_config_inbound_ports() {
+  if [[ ! -f "${DEPLOY_TARGET}" ]]; then
+    return 0
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    return 0
+  fi
+  python3 - <<PY 2>/dev/null || true
+import json
+from pathlib import Path
+p = Path("${DEPLOY_TARGET}")
+try:
+    obj = json.loads(p.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(0)
+for ib in obj.get("inbounds", []):
+    port = ib.get("port")
+    if isinstance(port, int) and 1 <= port <= 65535:
+        print(port)
+PY
+}
+
 check_port_conflicts() {
   local start_port="$1"
   local count="$2"
   local end_port=0
   local used=""
+  local current_cfg_ports=""
   local p=0
   local conflicts=""
   if [[ "${ALLOW_PORT_CONFLICT}" == "1" ]]; then
@@ -1043,8 +1089,12 @@ check_port_conflicts() {
   fi
   end_port=$((start_port + count - 1))
   used="$(collect_used_ports)"
+  current_cfg_ports=" $(collect_current_config_inbound_ports | tr '\n' ' ') "
   for ((p=start_port; p<=end_port; p++)); do
     if echo "${used}" | grep -Fxq "${p}"; then
+      if [[ "${current_cfg_ports}" == *" ${p} "* ]]; then
+        continue
+      fi
       conflicts="${conflicts} ${p}"
     fi
   done
@@ -1095,6 +1145,19 @@ find_free_start_port() {
     fi
   done
   return 1
+}
+
+stop_standalone_xray() {
+  local old_pid=""
+  if [[ -f "${STANDALONE_PID_FILE}" ]]; then
+    old_pid="$(cat "${STANDALONE_PID_FILE}" 2>/dev/null || true)"
+    if [[ -n "${old_pid}" ]] && kill -0 "${old_pid}" 2>/dev/null; then
+      kill "${old_pid}" 2>/dev/null || true
+      sleep 0.5
+      kill -9 "${old_pid}" 2>/dev/null || true
+    fi
+  fi
+  rm -f "${STANDALONE_PID_FILE}" >/dev/null 2>&1 || true
 }
 
 start_standalone_xray() {
