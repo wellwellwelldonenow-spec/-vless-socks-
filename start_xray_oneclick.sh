@@ -100,14 +100,16 @@ EOF
 collect_interactive_input() {
   INPUT_TMP="$(mktemp /tmp/xray_socks.XXXXXX.txt)"
   local line=""
+  local cleaned=""
   local normalized=""
   local blank_count=0
   local data_count=0
   echo "Paste socks lines (host:port:user:pass), one per line."
-  echo "Finish by: typing end/END/结束, or pressing Enter twice, or Ctrl+D."
+  echo "Finish by: typing end/END/结束/done/q/., or pressing Enter twice, or Ctrl+D."
   while IFS= read -r line || [[ -n "${line}" ]]; do
-    normalized="$(echo "${line}" | tr -d '[:space:]')"
-    if [[ "${normalized}" == "end" || "${normalized}" == "END" || "${normalized}" == "结束" ]]; then
+    cleaned="$(printf '%s' "${line}" | sed -E 's/\x1B\[[0-9;?]*[ -/]*[@-~]//g' | tr -d '\r')"
+    normalized="$(echo "${cleaned}" | tr -d '[:space:][:cntrl:]' | tr '[:upper:]' '[:lower:]')"
+    if [[ "${normalized}" == "end" || "${normalized}" == "结束" || "${normalized}" == "done" || "${normalized}" == "q" || "${normalized}" == "quit" || "${normalized}" == "." ]]; then
       break
     fi
     if [[ -z "${normalized}" ]]; then
@@ -121,7 +123,7 @@ collect_interactive_input() {
     fi
     blank_count=0
     ((data_count += 1))
-    echo "${line}" >> "${INPUT_TMP}"
+    echo "${cleaned}" >> "${INPUT_TMP}"
   done
   if (( data_count == 0 )); then
     echo "ERROR: no socks lines received" >&2
@@ -215,15 +217,17 @@ list_nodes_db() {
 collect_nodes_append_to_db() {
   local tmp=""
   local line=""
+  local cleaned=""
   local normalized=""
   local blank_count=0
   local data_count=0
   tmp="$(mktemp /tmp/node_add.XXXXXX)"
   echo "请粘贴要新增的 SOCKS（格式 host:port:user:pass）"
-  echo "结束方式: end / END / 结束 / 连续两次回车 / Ctrl+D"
+  echo "结束方式: end / END / 结束 / done / q / . / 连续两次回车 / Ctrl+D"
   while IFS= read -r line || [[ -n "${line}" ]]; do
-    normalized="$(echo "${line}" | tr -d '[:space:]')"
-    if [[ "${normalized}" == "end" || "${normalized}" == "END" || "${normalized}" == "结束" ]]; then
+    cleaned="$(printf '%s' "${line}" | sed -E 's/\x1B\[[0-9;?]*[ -/]*[@-~]//g' | tr -d '\r')"
+    normalized="$(echo "${cleaned}" | tr -d '[:space:][:cntrl:]' | tr '[:upper:]' '[:lower:]')"
+    if [[ "${normalized}" == "end" || "${normalized}" == "结束" || "${normalized}" == "done" || "${normalized}" == "q" || "${normalized}" == "quit" || "${normalized}" == "." ]]; then
       break
     fi
     if [[ -z "${normalized}" ]]; then
@@ -237,7 +241,7 @@ collect_nodes_append_to_db() {
     fi
     blank_count=0
     ((data_count += 1))
-    echo "${line}" >> "${tmp}"
+    echo "${cleaned}" >> "${tmp}"
   done
   if (( data_count == 0 )); then
     rm -f "${tmp}"
