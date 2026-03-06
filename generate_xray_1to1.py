@@ -15,6 +15,7 @@ import tempfile
 import urllib.parse
 import urllib.request
 import uuid
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -398,6 +399,16 @@ def parse_args() -> argparse.Namespace:
         default="qr_links.txt",
         help="Output QR links path (default: qr_links.txt)",
     )
+    parser.add_argument(
+        "--qr-bundle-zip",
+        default="qr_bundle.zip",
+        help="Output zip path containing all QR PNG files (default: qr_bundle.zip)",
+    )
+    parser.add_argument(
+        "--build-qr-bundle",
+        action="store_true",
+        help="Download all QR PNG files and pack into --qr-bundle-zip",
+    )
     return parser.parse_args()
 
 
@@ -533,6 +544,36 @@ def write_qr_links(path: Path, qr_lines: list[str]) -> None:
     path.write_text("\n".join(qr_lines) + "\n", encoding="utf-8")
 
 
+def build_qr_bundle(qr_lines: list[str], bundle_zip_path: Path) -> int:
+    if not qr_lines:
+        return 0
+    bundle_zip_path.parent.mkdir(parents=True, exist_ok=True)
+    success_count = 0
+    with tempfile.TemporaryDirectory(prefix="qr_bundle_") as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        for i, line in enumerate(qr_lines, start=1):
+            parts = line.split(" ", 1)
+            if len(parts) != 2:
+                continue
+            remark_raw, qr_url = parts
+            file_stem = sanitize_remark(remark_raw) or f"node-{i:03d}"
+            file_path = tmpdir_path / f"{i:03d}-{file_stem}.png"
+            try:
+                with urllib.request.urlopen(qr_url, timeout=8) as resp:
+                    content = resp.read()
+                if not content:
+                    continue
+                file_path.write_bytes(content)
+                success_count += 1
+            except Exception:
+                continue
+
+        with zipfile.ZipFile(bundle_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for png_file in sorted(tmpdir_path.glob("*.png")):
+                zf.write(png_file, arcname=png_file.name)
+    return success_count
+
+
 def run_validate(xray_bin: str, config_path: Path) -> None:
     cmd = [xray_bin, "-test", "-config", str(config_path)]
     try:
@@ -625,6 +666,7 @@ def main() -> int:
     v2rayn_lines: list[str] = []
     shadowrocket_lines: list[str] = []
     qr_lines: list[str] = []
+    qr_bundle_count = 0
     if args.public_host:
         v2rayn_lines, shadowrocket_lines = build_share_links(
             mapping=mapping,
@@ -648,6 +690,8 @@ def main() -> int:
                 shadowrocket_lines=shadowrocket_lines,
             )
             write_qr_links(Path(args.qr_links), qr_lines)
+        if args.build_qr_bundle:
+            qr_bundle_count = build_qr_bundle(qr_lines, Path(args.qr_bundle_zip))
 
     try:
         if args.validate:
@@ -673,6 +717,8 @@ def main() -> int:
             print(f"generated: {args.v2rayn_links}")
             print(f"generated: {args.shadowrocket_links}")
             print(f"generated: {args.qr_links}")
+        if args.build_qr_bundle:
+            print(f"generated: {args.qr_bundle_zip} ({qr_bundle_count} png)")
         if args.print_links:
             print("=== v2rayN links ===")
             for link in v2rayn_lines:

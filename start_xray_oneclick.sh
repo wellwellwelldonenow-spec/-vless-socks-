@@ -39,6 +39,11 @@ STANDALONE_PID_FILE="${STANDALONE_PID_FILE:-/tmp/xray-oneclick.pid}"
 STANDALONE_LOG_FILE="${STANDALONE_LOG_FILE:-/tmp/xray-oneclick.log}"
 AUTO_FIX_SERVICE="${AUTO_FIX_SERVICE:-1}"
 SERVICE_NAME="${SERVICE_NAME:-xray-oneclick.service}"
+PUBLIC_FILES_DIR="${PUBLIC_FILES_DIR:-/opt/xray-oneclick/public}"
+QR_BUNDLE_ZIP="${QR_BUNDLE_ZIP:-${PUBLIC_FILES_DIR}/qr_bundle.zip}"
+FILE_HTTP_PORT="${FILE_HTTP_PORT:-18089}"
+FILE_SERVICE_NAME="${FILE_SERVICE_NAME:-xray-oneclick-files.service}"
+AUTO_QR_FILE_SERVER="${AUTO_QR_FILE_SERVER:-1}"
 NO_SERVICE_MODE=0
 
 usage() {
@@ -74,6 +79,8 @@ Key env vars:
   AUTO_RUN_STANDALONE auto-run xray process when no systemd service exists (1/0, default: 1)
   AUTO_FIX_SERVICE  auto-create and enable systemd service if missing (1/0, default: 1)
   SERVICE_NAME      managed systemd unit name (default: xray-oneclick.service)
+  AUTO_QR_FILE_SERVER auto-start file server for QR bundle zip (1/0, default: 1)
+  FILE_HTTP_PORT    file server port for QR bundle download (default: 18089)
 EOF
 }
 
@@ -282,6 +289,33 @@ EOF
   systemctl enable --now "${SERVICE_NAME}"
   systemctl is-active --quiet "${SERVICE_NAME}"
   echo "service ready: ${SERVICE_NAME}"
+  return 0
+}
+
+ensure_file_service() {
+  local service_path="/etc/systemd/system/${FILE_SERVICE_NAME}"
+  mkdir -p "${PUBLIC_FILES_DIR}"
+  if ! command -v systemctl >/dev/null 2>&1; then
+    return 1
+  fi
+  cat > "${service_path}" <<EOF
+[Unit]
+Description=Xray OneClick Public Files Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -m http.server ${FILE_HTTP_PORT} --directory ${PUBLIC_FILES_DIR}
+Restart=always
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now "${FILE_SERVICE_NAME}"
+  systemctl is-active --quiet "${FILE_SERVICE_NAME}"
   return 0
 }
 
@@ -528,6 +562,8 @@ ARGS=(
   "--fingerprint" "${FINGERPRINT}"
   "--spx" "${SPX}"
   "--qr-size" "${QR_SIZE}"
+  "--qr-bundle-zip" "${QR_BUNDLE_ZIP}"
+  "--build-qr-bundle"
   "--no-link-files"
   "--print-links"
   "--print-qr"
@@ -557,6 +593,15 @@ if [[ "${NO_SERVICE_MODE}" == "1" ]]; then
   else
     echo "ERROR: no runnable service mode available" >&2
     exit 1
+  fi
+fi
+
+if [[ "${AUTO_QR_FILE_SERVER}" == "1" ]] && [[ -f "${QR_BUNDLE_ZIP}" ]]; then
+  if ensure_file_service; then
+    echo "QR bundle download:"
+    echo "http://${PUBLIC_HOST}:${FILE_HTTP_PORT}/$(basename "${QR_BUNDLE_ZIP}")"
+  else
+    echo "WARN: failed to start QR file server service ${FILE_SERVICE_NAME}" >&2
   fi
 fi
 
