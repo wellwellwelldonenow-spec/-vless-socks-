@@ -416,6 +416,11 @@ def parse_args() -> argparse.Namespace:
         default=20,
         help="Concurrent workers for SOCKS egress IP probing (default: 20)",
     )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable progress logs during generation",
+    )
     return parser.parse_args()
 
 
@@ -522,12 +527,16 @@ def detect_exit_ip_via_socks(entry: SocksEntry, timeout_sec: float) -> str:
 
 
 def detect_exit_ips_for_entries(
-    entries: list[SocksEntry], timeout_sec: float, workers: int
+    entries: list[SocksEntry], timeout_sec: float, workers: int, show_progress: bool
 ) -> list[str]:
     if not entries:
         return []
     workers = max(1, min(workers, len(entries), 64))
     results = [""] * len(entries)
+    total = len(entries)
+    completed = 0
+    if show_progress:
+        print(f"[progress] 探测 SOCKS 出口IP: 0/{total}", file=sys.stderr, flush=True)
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         future_map = {
             pool.submit(detect_exit_ip_via_socks, entry, timeout_sec): idx
@@ -539,6 +548,14 @@ def detect_exit_ips_for_entries(
                 results[idx] = fut.result() or ""
             except Exception:
                 results[idx] = ""
+            completed += 1
+            if show_progress:
+                if sys.stderr.isatty():
+                    print(f"\r[progress] 探测 SOCKS 出口IP: {completed}/{total}", end="", file=sys.stderr, flush=True)
+                else:
+                    print(f"[progress] 探测 SOCKS 出口IP: {completed}/{total}", file=sys.stderr, flush=True)
+    if show_progress and sys.stderr.isatty():
+        print("", file=sys.stderr, flush=True)
     return results
 
 
@@ -553,6 +570,7 @@ def build_share_links(
     remark_prefix: str,
     exit_ip_timeout: float,
     exit_ip_workers: int,
+    show_progress: bool,
 ) -> list[str]:
     share_lines = []
     country_cache: dict[str, str] = {}
@@ -560,7 +578,15 @@ def build_share_links(
         entries=entries,
         timeout_sec=exit_ip_timeout,
         workers=exit_ip_workers,
+        show_progress=show_progress,
     )
+    if show_progress:
+        ok_count = sum(1 for ip in exit_ips if ip)
+        print(
+            f"[progress] 出口IP探测完成: 成功 {ok_count}/{len(entries)}，失败 {len(entries)-ok_count}",
+            file=sys.stderr,
+            flush=True,
+        )
     for idx, row in enumerate(mapping):
         exit_ip = exit_ips[idx] if idx < len(exit_ips) else ""
         if exit_ip and exit_ip not in country_cache:
@@ -768,6 +794,8 @@ def main() -> int:
     qr_lines: list[str] = []
     qr_bundle_count = 0
     if args.public_host:
+        if not args.no_progress:
+            print("[progress] 开始生成分享链接...", file=sys.stderr, flush=True)
         share_lines = build_share_links(
             mapping=mapping,
             entries=entries,
@@ -779,22 +807,29 @@ def main() -> int:
             remark_prefix=args.remark_prefix,
             exit_ip_timeout=args.exit_ip_timeout,
             exit_ip_workers=args.exit_ip_workers,
+            show_progress=not args.no_progress,
         )
         qr_lines = build_qr_links(
             vless_lines=share_lines,
             qr_api_base=args.qr_api_base,
             qr_size=args.qr_size,
         )
+        if not args.no_progress:
+            print("[progress] 链接与二维码索引已生成", file=sys.stderr, flush=True)
         if not args.no_link_files:
             write_share_links(links_file=Path(args.links_file), share_lines=share_lines)
             write_qr_links(Path(args.qr_links), qr_lines)
         if args.build_qr_bundle:
+            if not args.no_progress:
+                print("[progress] 正在打包二维码与链接文件...", file=sys.stderr, flush=True)
             qr_bundle_count = build_qr_bundle(
                 qr_lines=qr_lines,
                 bundle_zip_path=Path(args.qr_bundle_zip),
                 share_lines=share_lines,
                 links_filename=Path(args.links_file).name,
             )
+            if not args.no_progress:
+                print("[progress] 二维码压缩包已生成", file=sys.stderr, flush=True)
     write_mapping_csv(Path(args.mapping), mapping)
 
     try:

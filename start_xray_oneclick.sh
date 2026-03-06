@@ -108,18 +108,21 @@ collect_interactive_input() {
   local normalized=""
   local blank_count=0
   local data_count=0
+  local end_reason=""
   echo "Paste socks lines (host:port:user:pass), one per line."
   echo "Finish by: typing end/END/结束/done/q/., or pressing Enter twice, or Ctrl+D."
   while IFS= read -r line || [[ -n "${line}" ]]; do
     cleaned="$(printf '%s' "${line}" | sed -E 's/\x1B\[[0-9;?]*[ -/]*[@-~]//g' | tr -d '\r')"
     normalized="$(echo "${cleaned}" | tr -d '[:space:][:cntrl:]' | tr '[:upper:]' '[:lower:]')"
     if [[ "${normalized}" == "end" || "${normalized}" == "结束" || "${normalized}" == "done" || "${normalized}" == "q" || "${normalized}" == "quit" || "${normalized}" == "." ]]; then
+      end_reason="marker"
       break
     fi
     if [[ -z "${normalized}" ]]; then
       if (( data_count > 0 )); then
         ((blank_count += 1))
         if (( blank_count >= 2 )); then
+          end_reason="double-enter"
           break
         fi
       fi
@@ -132,6 +135,13 @@ collect_interactive_input() {
   if (( data_count == 0 )); then
     echo "ERROR: no socks lines received" >&2
     exit 1
+  fi
+  if [[ "${end_reason}" == "double-enter" ]]; then
+    echo "检测到连续两次回车，已接收 ${data_count} 条 SOCKS，开始生成..."
+  elif [[ "${end_reason}" == "marker" ]]; then
+    echo "检测到结束标记，已接收 ${data_count} 条 SOCKS，开始生成..."
+  else
+    echo "已接收 ${data_count} 条 SOCKS，开始生成..."
   fi
   INPUT_FILE="${INPUT_TMP}"
 }
@@ -242,6 +252,7 @@ collect_nodes_append_to_db() {
   local normalized=""
   local blank_count=0
   local data_count=0
+  local end_reason=""
   tmp="$(mktemp /tmp/node_add.XXXXXX)"
   echo "请粘贴要新增的 SOCKS（格式 host:port:user:pass）"
   echo "结束方式: end / END / 结束 / done / q / . / 连续两次回车 / Ctrl+D"
@@ -249,12 +260,14 @@ collect_nodes_append_to_db() {
     cleaned="$(printf '%s' "${line}" | sed -E 's/\x1B\[[0-9;?]*[ -/]*[@-~]//g' | tr -d '\r')"
     normalized="$(echo "${cleaned}" | tr -d '[:space:][:cntrl:]' | tr '[:upper:]' '[:lower:]')"
     if [[ "${normalized}" == "end" || "${normalized}" == "结束" || "${normalized}" == "done" || "${normalized}" == "q" || "${normalized}" == "quit" || "${normalized}" == "." ]]; then
+      end_reason="marker"
       break
     fi
     if [[ -z "${normalized}" ]]; then
       if (( data_count > 0 )); then
         ((blank_count += 1))
         if (( blank_count >= 2 )); then
+          end_reason="double-enter"
           break
         fi
       fi
@@ -273,6 +286,11 @@ collect_nodes_append_to_db() {
   touch "${NODES_DB}"
   cat "${tmp}" >> "${NODES_DB}"
   rm -f "${tmp}"
+  if [[ "${end_reason}" == "double-enter" ]]; then
+    echo "检测到连续两次回车，新增 ${data_count} 条节点。"
+  elif [[ "${end_reason}" == "marker" ]]; then
+    echo "检测到结束标记，新增 ${data_count} 条节点。"
+  fi
   echo "新增完成，已写入: ${NODES_DB}"
   return 0
 }
