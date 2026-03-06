@@ -841,10 +841,51 @@ check_port_conflicts() {
   done
   if [[ -n "${conflicts}" ]]; then
     echo "ERROR: inbound port conflict:${conflicts}" >&2
+    if echo "${conflicts}" | grep -Eq '(^|[[:space:]])22($|[[:space:]])|(^|[[:space:]])53($|[[:space:]])'; then
+      echo "Hint: 检测到 22/53 冲突，通常是 START_PORT 过低（如 22），建议改为 20000+" >&2
+    fi
     echo "Hint: change START_PORT, stop old service/process, or set ALLOW_PORT_CONFLICT=1" >&2
     return 1
   fi
   return 0
+}
+
+find_free_start_port() {
+  local count="$1"
+  local start_from="${2:-20000}"
+  local max_start=0
+  local s=0
+  local p=0
+  local ok=0
+  local used_list=""
+
+  if [[ -z "${count}" || ! "${count}" =~ ^[0-9]+$ || "${count}" -le 0 ]]; then
+    return 1
+  fi
+  if [[ -z "${start_from}" || ! "${start_from}" =~ ^[0-9]+$ || "${start_from}" -lt 1 ]]; then
+    start_from=20000
+  fi
+
+  max_start=$((65535 - count + 1))
+  if (( start_from > max_start )); then
+    start_from=1
+  fi
+
+  used_list="$(collect_used_ports | tr '\n' ' ')"
+  for ((s=start_from; s<=max_start; s++)); do
+    ok=1
+    for ((p=s; p<=s+count-1; p++)); do
+      if [[ " ${used_list} " == *" ${p} "* ]]; then
+        ok=0
+        break
+      fi
+    done
+    if (( ok == 1 )); then
+      echo "${s}"
+      return 0
+    fi
+  done
+  return 1
 }
 
 start_standalone_xray() {
@@ -973,7 +1014,28 @@ if [[ "${ENTRY_COUNT}" -le 0 ]]; then
   echo "ERROR: no valid input lines" >&2
   exit 1
 fi
-check_port_conflicts "${START_PORT}" "${ENTRY_COUNT}"
+
+if ! check_port_conflicts "${START_PORT}" "${ENTRY_COUNT}"; then
+  if [[ -t 0 ]]; then
+    SUGGESTED_PORT="$(find_free_start_port "${ENTRY_COUNT}" "${START_PORT_DEFAULT}" || true)"
+    if [[ -n "${SUGGESTED_PORT}" ]]; then
+      echo "检测到端口冲突，建议自动切换到 START_PORT=${SUGGESTED_PORT}"
+      read -r -p "是否使用该端口继续？[Y/n]: " ans || true
+      ans="$(echo "${ans}" | tr -d '[:space:]')"
+      if [[ -z "${ans}" || "${ans}" == "Y" || "${ans}" == "y" ]]; then
+        START_PORT="${SUGGESTED_PORT}"
+        echo "已切换 START_PORT=${START_PORT}"
+      else
+        exit 1
+      fi
+    else
+      echo "未找到可用连续端口段，请手动设置 START_PORT 后重试" >&2
+      exit 1
+    fi
+  else
+    exit 1
+  fi
+fi
 
 ARGS=(
   "--output" "${OUTPUT_CONFIG}"
