@@ -66,6 +66,9 @@ Usage:
      ./start_xray_oneclick.sh
      (paste lines, then input end/END/结束, or press Enter twice, or Ctrl+D)
 
+  4) uninstall all managed resources:
+     ./start_xray_oneclick.sh --uninstall
+
 Input format (one line each):
   host:port:username:password
 
@@ -427,7 +430,7 @@ except Exception:
     print("config parse failed:", p)
     raise SystemExit(0)
 ports=[str(b.get("port")) for b in c.get("inbounds",[]) if b.get("port")]
-    print("配置入站端口:", ",".join(ports) if ports else "无")
+print("配置入站端口:", ",".join(ports) if ports else "无")
 PY
   fi
   ss -lnt 2>/dev/null | awk 'NR==1 || /:20[0-9]{3}|:18[0-9]{3}/'
@@ -485,6 +488,64 @@ show_qr_bundle_download() {
   fi
 }
 
+uninstall_everything() {
+  local confirm="${1:-}"
+  local pid=""
+  local svc=""
+  local candidate=""
+
+  if [[ "${confirm}" != "YES" ]]; then
+    read -r -p "此操作会停止并删除 xray-oneclick 相关服务/配置/文件，输入 YES 确认卸载: " confirm || true
+  fi
+  if [[ "${confirm}" != "YES" ]]; then
+    echo "已取消"
+    return 1
+  fi
+
+  echo "开始卸载并清理..."
+
+  if command -v systemctl >/dev/null 2>&1; then
+    for svc in "${SERVICE_NAME}" "${FILE_SERVICE_NAME}"; do
+      systemctl stop "${svc}" >/dev/null 2>&1 || true
+      systemctl disable "${svc}" >/dev/null 2>&1 || true
+      rm -f "/etc/systemd/system/${svc}" >/dev/null 2>&1 || true
+    done
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl reset-failed >/dev/null 2>&1 || true
+  fi
+
+  if [[ -f "${STANDALONE_PID_FILE}" ]]; then
+    pid="$(cat "${STANDALONE_PID_FILE}" 2>/dev/null || true)"
+    if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+      kill "${pid}" >/dev/null 2>&1 || true
+      sleep 0.5
+      kill -9 "${pid}" >/dev/null 2>&1 || true
+    fi
+  fi
+  pkill -f "xray.*run -c ${DEPLOY_TARGET}" >/dev/null 2>&1 || true
+
+  rm -f "${STANDALONE_PID_FILE}" "${STANDALONE_LOG_FILE}" >/dev/null 2>&1 || true
+  rm -f "${DEPLOY_TARGET}" >/dev/null 2>&1 || true
+  rm -f "${NODES_DB}" "${START_PORT_FILE}" "${DOWNLOAD_KEY_FILE}" >/dev/null 2>&1 || true
+  rm -rf "${PUBLIC_FILES_DIR}" >/dev/null 2>&1 || true
+
+  for candidate in /usr/local/bin/xray-oneclick /usr/local/bin/xray-oneclick-uninstall "$HOME/.local/bin/xray-oneclick" "$HOME/.local/bin/xray-oneclick-uninstall"; do
+    rm -f "${candidate}" >/dev/null 2>&1 || true
+  done
+  for candidate in /opt/xray-oneclick "$HOME/.local/xray-oneclick"; do
+    if [[ -d "${candidate}" ]]; then
+      rm -rf "${candidate}" >/dev/null 2>&1 || true
+    fi
+  done
+
+  if [[ "${XRAY_INSTALL_PATH}" == "/root/xray" ]] && [[ -f "${XRAY_INSTALL_PATH}" ]]; then
+    rm -f "${XRAY_INSTALL_PATH}" >/dev/null 2>&1 || true
+  fi
+
+  echo "卸载完成：xray-oneclick 相关资源已全部清除。"
+  return 0
+}
+
 interactive_menu() {
   local choice=""
   local idx=""
@@ -506,6 +567,7 @@ interactive_menu() {
 10) 批量删除节点
 11) 查看节点库
 12) 删除全部节点
+13) 卸载并全部清除
 0) 退出
 =======================================
 EOF
@@ -558,6 +620,10 @@ EOF
           USE_SAVED_PORT=1
           return 0
         fi
+        ;;
+      13)
+        uninstall_everything || true
+        exit 0
         ;;
       0|q|Q) exit 0 ;;
       *) echo "无效选项" ;;
@@ -805,6 +871,16 @@ start_standalone_xray() {
   echo "standalone xray started: pid=$(cat "${STANDALONE_PID_FILE}") log=${STANDALONE_LOG_FILE}"
   return 0
 }
+
+if [[ "${1:-}" == "--uninstall" || "${1:-}" == "uninstall" ]]; then
+  shift || true
+  if [[ "${1:-}" == "--yes" || "${1:-}" == "-y" ]]; then
+    uninstall_everything "YES"
+  else
+    uninstall_everything
+  fi
+  exit $?
+fi
 
 while getopts ":hi:" opt; do
   case "${opt}" in

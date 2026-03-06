@@ -38,6 +38,14 @@ curl -fsSL https://raw.githubusercontent.com/<你的用户名>/<你的仓库名>
 xray-oneclick
 ```
 
+卸载并全部清除：
+
+```bash
+xray-oneclick --uninstall
+# 或
+xray-oneclick-uninstall
+```
+
 ## 环境变量
 
 - `PUBLIC_HOST`：公网 IP 或域名（不填则自动探测）
@@ -48,4 +56,3 @@ xray-oneclick
 - `AUTO_INSTALL_XRAY`：缺少 xray 时自动安装（默认 `1`）
 - `XRAY_INSTALL_PATH`：自动安装目标（默认 `/root/xray`）
 - `XRAY_LOCAL_ZIP`：本地 xray zip 路径（默认 `/root/Xray-linux-64.zip`）
-

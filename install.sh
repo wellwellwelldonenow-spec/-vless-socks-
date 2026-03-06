@@ -66,12 +66,19 @@ exec "${INSTALL_DIR}/start_xray_oneclick.sh" "\$@"
 EOF
 chmod +x "${BIN_DIR}/xray-oneclick"
 
+cat > "${BIN_DIR}/xray-oneclick-uninstall" <<EOF
+#!/usr/bin/env bash
+exec "${INSTALL_DIR}/start_xray_oneclick.sh" --uninstall "\$@"
+EOF
+chmod +x "${BIN_DIR}/xray-oneclick-uninstall"
+
 echo "Installed:"
 echo "  ${INSTALL_DIR}/start_xray_oneclick.sh"
 echo "  ${INSTALL_DIR}/generate_xray_1to1.py"
 echo "  ${INSTALL_DIR}/qr_download_server.py"
 echo "Command:"
 echo "  ${BIN_DIR}/xray-oneclick"
+echo "  ${BIN_DIR}/xray-oneclick-uninstall"
 
 if [[ ":${PATH}:" != *":${BIN_DIR}:"* ]]; then
   echo "NOTE: ${BIN_DIR} is not in PATH, run with full path:"
