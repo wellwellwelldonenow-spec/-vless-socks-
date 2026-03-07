@@ -559,6 +559,10 @@ def detect_exit_ips_for_entries(
     return results
 
 
+def format_socks_endpoint(entry: SocksEntry) -> str:
+    return f"{entry.host}:{entry.port}:{entry.username}"
+
+
 def build_share_links(
     mapping: list[dict],
     entries: list[SocksEntry],
@@ -588,12 +592,27 @@ def build_share_links(
             flush=True,
         )
     for idx, row in enumerate(mapping):
+        entry = entries[idx]
         exit_ip = exit_ips[idx] if idx < len(exit_ips) else ""
         if exit_ip and exit_ip not in country_cache:
             country_cache[exit_ip] = query_country_by_ip(exit_ip)
         country = country_cache.get(exit_ip, "Unknown") if exit_ip else "Unknown"
         row["socks_exit_ip"] = exit_ip
         row["socks_exit_country"] = country
+        if show_progress:
+            endpoint = format_socks_endpoint(entry)
+            if exit_ip:
+                print(
+                    f"[socks-check] OK   {endpoint} -> {exit_ip} ({country})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[socks-check] FAIL {endpoint} -> unreachable/auth-failed/timeout",
+                    file=sys.stderr,
+                    flush=True,
+                )
         display_host = exit_ip if exit_ip else "unknown-exit-ip"
 
         remark = sanitize_remark(f"{display_host}-{country}-{remark_prefix}-{int(row['index']):03d}")
