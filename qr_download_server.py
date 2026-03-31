@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import html
+import mimetypes
 import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -38,6 +39,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _render_index(self, msg: str) -> None:
         bundle_name = html.escape(self.bundle_path.name)
+        extra_items = self._render_extra_downloads()
         message = f"<p style='color:#b91c1c'>{html.escape(msg)}</p>" if msg else ""
         body = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>QR Bundle Download</title></head>
@@ -49,27 +51,71 @@ class Handler(BaseHTTPRequestHandler):
   <input name="k" type="password" placeholder="输入下载密钥" style="width:340px;padding:8px" />
   <button type="submit" style="padding:8px 14px">下载</button>
 </form>
+{extra_items}
 </body></html>"""
         self._send_html(200, body)
 
+    def _available_extra_files(self) -> list[Path]:
+        files: list[Path] = []
+        bundle_dir = self.bundle_path.parent
+        candidates = [
+            bundle_dir / "append_links_latest.txt",
+            bundle_dir / "append_qr_links_latest.txt",
+            bundle_dir / "append_qr_bundle_latest.zip",
+        ]
+        for candidate in candidates:
+            if candidate.is_file():
+                files.append(candidate)
+        return files
+
+    def _render_extra_downloads(self) -> str:
+        items = self._available_extra_files()
+        if not items:
+            return ""
+        lis = []
+        for item in items:
+            name = html.escape(item.name)
+            href = f"/download?file={name}"
+            lis.append(f"<li><a href=\"{href}\">{name}</a>（需输入相同下载密钥）</li>")
+        return "<hr><h3>新增节点独立文件</h3><ul>" + "".join(lis) + "</ul>"
+
+    def _resolve_download_target(self, requested_file: str) -> Path:
+        if not requested_file:
+            return self.bundle_path
+        filename = os.path.basename(requested_file.strip())
+        if not filename or filename in (".", ".."):
+            return self.bundle_path
+        target = (self.bundle_path.parent / filename).resolve()
+        bundle_dir = self.bundle_path.parent.resolve()
+        try:
+            target.relative_to(bundle_dir)
+        except ValueError:
+            return self.bundle_path
+        return target
+
     def _handle_download(self, query: str) -> None:
         key = read_key(self.key_path)
-        req_key = parse_qs(query).get("k", [""])[0].strip()
+        params = parse_qs(query)
+        req_key = params.get("k", [""])[0].strip()
         if not key or req_key != key:
             self._render_index("密钥错误或未设置，请重试。")
             return
 
-        if not self.bundle_path.is_file():
+        target = self._resolve_download_target(params.get("file", [""])[0])
+        if not target.is_file():
             self._send_html(404, "<h1>二维码压缩包不存在</h1>")
             return
 
-        size = self.bundle_path.stat().st_size
+        content_type, _ = mimetypes.guess_type(str(target))
+        if not content_type:
+            content_type = "application/octet-stream"
+        size = target.stat().st_size
         self.send_response(200)
-        self.send_header("Content-Type", "application/zip")
-        self.send_header("Content-Disposition", f'attachment; filename="{self.bundle_path.name}"')
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Disposition", f'attachment; filename="{target.name}"')
         self.send_header("Content-Length", str(size))
         self.end_headers()
-        with self.bundle_path.open("rb") as f:
+        with target.open("rb") as f:
             while True:
                 chunk = f.read(1024 * 256)
                 if not chunk:

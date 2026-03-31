@@ -29,6 +29,8 @@ except ImportError:
 
 
 HOST_RE = re.compile(r"^[A-Za-z0-9.-]+$")
+INBOUND_TAG_RE = re.compile(r"^in-(\d+)$")
+OUTBOUND_TAG_RE = re.compile(r"^out-(\d+)$")
 
 
 @dataclass
@@ -142,6 +144,10 @@ def load_entries(path: str | None) -> list[SocksEntry]:
     return entries
 
 
+def clone_json(data: dict) -> dict:
+    return json.loads(json.dumps(data))
+
+
 def build_config(
     entries: list[SocksEntry],
     start_port: int,
@@ -151,6 +157,8 @@ def build_config(
     flow: str,
     per_inbound_key: bool,
     xray_bin: str,
+    start_index: int = 1,
+    include_default_outbounds: bool = True,
 ) -> tuple[dict, list[dict]]:
     if start_port < 1 or start_port > 65535:
         raise ValueError("start-port must be in range 1..65535")
@@ -168,8 +176,9 @@ def build_config(
 
     for i, entry in enumerate(entries, start=1):
         inbound_port = start_port + i - 1
-        in_tag = f"in-{i:03d}"
-        out_tag = f"out-{i:03d}"
+        inbound_index = start_index + i - 1
+        in_tag = f"in-{inbound_index:03d}"
+        out_tag = f"out-{inbound_index:03d}"
         client_uuid = str(uuid.uuid4())
         short_id = secrets.token_hex(8)
         if per_inbound_key:
@@ -229,7 +238,7 @@ def build_config(
         rules.append(rule)
         mapping.append(
             {
-                "index": i,
+                "index": inbound_index,
                 "inbound_tag": in_tag,
                 "inbound_port": inbound_port,
                 "outbound_tag": out_tag,
@@ -245,14 +254,118 @@ def build_config(
     config = {
         "log": {"loglevel": "warning"},
         "inbounds": inbounds,
-        "outbounds": outbounds
-        + [
-            {"tag": "direct", "protocol": "freedom", "settings": {}},
-            {"tag": "block", "protocol": "blackhole", "settings": {}},
-        ],
+        "outbounds": outbounds,
         "routing": {"domainStrategy": "AsIs", "rules": rules},
     }
+    if include_default_outbounds:
+        config["outbounds"].extend(
+            [
+                {"tag": "direct", "protocol": "freedom", "settings": {}},
+                {"tag": "block", "protocol": "blackhole", "settings": {}},
+            ]
+        )
     return config, mapping
+
+
+def load_existing_config(path: str | None) -> dict | None:
+    if not path:
+        return None
+    cfg_path = Path(path)
+    if not cfg_path.exists():
+        raise ValueError(f"append config not found: {cfg_path}")
+    try:
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"failed to parse append config: {cfg_path}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"append config must be a JSON object: {cfg_path}")
+    return data
+
+
+def detect_next_index(existing_config: dict) -> int:
+    max_index = 0
+    for inbound in existing_config.get("inbounds", []):
+        tag = str(inbound.get("tag", ""))
+        match = INBOUND_TAG_RE.match(tag)
+        if match:
+            max_index = max(max_index, int(match.group(1)))
+    for outbound in existing_config.get("outbounds", []):
+        tag = str(outbound.get("tag", ""))
+        match = OUTBOUND_TAG_RE.match(tag)
+        if match:
+            max_index = max(max_index, int(match.group(1)))
+    return max_index + 1
+
+
+def collect_used_ports(existing_config: dict) -> set[int]:
+    ports: set[int] = set()
+    for inbound in existing_config.get("inbounds", []):
+        port = inbound.get("port")
+        if isinstance(port, int) and 1 <= port <= 65535:
+            ports.add(port)
+    return ports
+
+
+def find_next_available_start_port(
+    used_ports: set[int], count: int, preferred_start: int
+) -> int:
+    if count <= 0:
+        raise ValueError("append count must be positive")
+    if preferred_start < 1:
+        preferred_start = 1
+    max_start = 65535 - count + 1
+    if preferred_start > max_start:
+        raise ValueError("no available port range for append")
+    start = preferred_start
+    while start <= max_start:
+        if all((start + offset) not in used_ports for offset in range(count)):
+            return start
+        start += 1
+    raise ValueError("no available consecutive ports for append")
+
+
+def build_appended_config(
+    existing_config: dict,
+    entries: list[SocksEntry],
+    listen: str,
+    server_names: list[str],
+    dest: str,
+    flow: str,
+    per_inbound_key: bool,
+    xray_bin: str,
+) -> tuple[dict, list[dict], int]:
+    merged_config = clone_json(existing_config)
+    merged_config.setdefault("log", {"loglevel": "warning"})
+    merged_config.setdefault("inbounds", [])
+    merged_config.setdefault("outbounds", [])
+    routing = merged_config.setdefault("routing", {})
+    routing.setdefault("domainStrategy", "AsIs")
+    routing.setdefault("rules", [])
+
+    next_index = detect_next_index(merged_config)
+    used_ports = collect_used_ports(merged_config)
+    preferred_start = (max(used_ports) + 1) if used_ports else 20000
+    start_port = find_next_available_start_port(
+        used_ports=used_ports,
+        count=len(entries),
+        preferred_start=preferred_start,
+    )
+    additions_config, mapping = build_config(
+        entries=entries,
+        start_port=start_port,
+        listen=listen,
+        server_names=server_names,
+        dest=dest,
+        flow=flow,
+        per_inbound_key=per_inbound_key,
+        xray_bin=xray_bin,
+        start_index=next_index,
+        include_default_outbounds=False,
+    )
+    merged_config["inbounds"].extend(additions_config["inbounds"])
+    merged_config["outbounds"].extend(additions_config["outbounds"])
+    merged_config["routing"]["rules"].extend(additions_config["routing"]["rules"])
+    return merged_config, mapping, start_port
 
 
 def write_mapping_csv(path: Path, mapping: list[dict]) -> None:
@@ -340,6 +453,10 @@ def parse_args() -> argparse.Namespace:
         help="Treat reload failure as fatal (default: warning only)",
     )
     parser.add_argument(
+        "--append-to-config",
+        help="Append new nodes to an existing deployed config instead of rebuilding it",
+    )
+    parser.add_argument(
         "--public-host",
         help="Public server domain/IP used in client share links",
     )
@@ -362,6 +479,26 @@ def parse_args() -> argparse.Namespace:
         "--links-file",
         default="links.txt",
         help="Output unified VLESS links file (default: links.txt)",
+    )
+    parser.add_argument(
+        "--existing-links-file",
+        help="Existing links file used to preserve previous links during append",
+    )
+    parser.add_argument(
+        "--existing-qr-bundle",
+        help="Existing QR bundle zip used to preserve previous QR PNG files during append",
+    )
+    parser.add_argument(
+        "--append-only-links-file",
+        help="When appending, also write links for new nodes only to this file",
+    )
+    parser.add_argument(
+        "--append-only-qr-links",
+        help="When appending, also write QR links for new nodes only to this file",
+    )
+    parser.add_argument(
+        "--append-only-qr-bundle-zip",
+        help="When appending, also write a QR bundle zip containing new nodes only to this file",
     )
     parser.add_argument(
         "--no-link-files",
@@ -636,6 +773,35 @@ def write_share_links(links_file: Path, share_lines: list[str]) -> None:
     links_file.write_text("\n".join(share_lines) + "\n", encoding="utf-8")
 
 
+def load_share_links_from_text(path: Path) -> list[str]:
+    return [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def load_existing_share_links(
+    links_file: str | None, qr_bundle_zip: str | None
+) -> list[str]:
+    if links_file:
+        path = Path(links_file)
+        if path.exists():
+            return load_share_links_from_text(path)
+    if qr_bundle_zip:
+        bundle_path = Path(qr_bundle_zip)
+        if bundle_path.exists():
+            try:
+                with zipfile.ZipFile(bundle_path) as zf:
+                    for candidate in ("links.txt", "links_txt.txt"):
+                        if candidate in zf.namelist():
+                            text = zf.read(candidate).decode("utf-8", "ignore")
+                            return [line.strip() for line in text.splitlines() if line.strip()]
+            except Exception:
+                return []
+    return []
+
+
 def build_qr_links(vless_lines: list[str], qr_api_base: str, qr_size: int) -> list[str]:
     qr_lines: list[str] = []
     size = qr_size if qr_size > 0 else 300
@@ -662,14 +828,30 @@ def build_qr_bundle(
     bundle_zip_path: Path,
     share_lines: list[str] | None = None,
     links_filename: str = "links.txt",
+    existing_bundle_path: Path | None = None,
 ) -> int:
-    if not qr_lines:
+    if not qr_lines and not (existing_bundle_path and existing_bundle_path.exists()):
         return 0
     bundle_zip_path.parent.mkdir(parents=True, exist_ok=True)
     success_count = 0
     used_stems: dict[str, int] = {}
     with tempfile.TemporaryDirectory(prefix="qr_bundle_") as tmpdir:
         tmpdir_path = Path(tmpdir)
+        if existing_bundle_path and existing_bundle_path.exists():
+            try:
+                with zipfile.ZipFile(existing_bundle_path) as zf:
+                    for member in zf.infolist():
+                        name = Path(member.filename).name
+                        if not name or name == links_filename:
+                            continue
+                        target = tmpdir_path / name
+                        if member.is_dir():
+                            continue
+                        target.write_bytes(zf.read(member.filename))
+                        if target.suffix.lower() == ".png":
+                            used_stems[target.stem] = used_stems.get(target.stem, 0) + 1
+            except Exception:
+                pass
         for i, line in enumerate(qr_lines, start=1):
             parts = line.split(" ", 1)
             if len(parts) != 2:
@@ -793,16 +975,31 @@ def main() -> int:
     args = parse_args()
     try:
         entries = load_entries(args.input)
-        config, mapping = build_config(
-            entries=entries,
-            start_port=args.start_port,
-            listen=args.listen,
-            server_names=[args.server_name],
-            dest=args.dest,
-            flow=args.flow,
-            per_inbound_key=args.per_inbound_key,
-            xray_bin=args.xray_bin,
-        )
+        existing_config = load_existing_config(args.append_to_config)
+        append_mode = existing_config is not None
+        if append_mode:
+            config, mapping, append_start_port = build_appended_config(
+                existing_config=existing_config,
+                entries=entries,
+                listen=args.listen,
+                server_names=[args.server_name],
+                dest=args.dest,
+                flow=args.flow,
+                per_inbound_key=args.per_inbound_key,
+                xray_bin=args.xray_bin,
+            )
+        else:
+            append_start_port = args.start_port
+            config, mapping = build_config(
+                entries=entries,
+                start_port=args.start_port,
+                listen=args.listen,
+                server_names=[args.server_name],
+                dest=args.dest,
+                flow=args.flow,
+                per_inbound_key=args.per_inbound_key,
+                xray_bin=args.xray_bin,
+            )
     except (ValueError, RuntimeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
@@ -812,9 +1009,11 @@ def main() -> int:
     share_lines: list[str] = []
     qr_lines: list[str] = []
     qr_bundle_count = 0
+    merged_share_lines: list[str] = []
     if args.public_host:
         if not args.no_progress:
-            print("[progress] 开始生成分享链接...", file=sys.stderr, flush=True)
+            mode_label = "追加模式" if append_mode else "全量模式"
+            print(f"[progress] 开始生成分享链接... ({mode_label})", file=sys.stderr, flush=True)
         share_lines = build_share_links(
             mapping=mapping,
             entries=entries,
@@ -828,6 +1027,13 @@ def main() -> int:
             exit_ip_workers=args.exit_ip_workers,
             show_progress=not args.no_progress,
         )
+        merged_share_lines = share_lines
+        if append_mode:
+            existing_share_lines = load_existing_share_links(
+                links_file=args.existing_links_file,
+                qr_bundle_zip=args.existing_qr_bundle or args.qr_bundle_zip,
+            )
+            merged_share_lines = existing_share_lines + share_lines
         qr_lines = build_qr_links(
             vless_lines=share_lines,
             qr_api_base=args.qr_api_base,
@@ -836,17 +1042,46 @@ def main() -> int:
         if not args.no_progress:
             print("[progress] 链接与二维码索引已生成", file=sys.stderr, flush=True)
         if not args.no_link_files:
-            write_share_links(links_file=Path(args.links_file), share_lines=share_lines)
+            write_share_links(
+                links_file=Path(args.links_file), share_lines=merged_share_lines
+            )
             write_qr_links(Path(args.qr_links), qr_lines)
+            if append_mode and args.append_only_links_file:
+                write_share_links(
+                    links_file=Path(args.append_only_links_file), share_lines=share_lines
+                )
+            if append_mode and args.append_only_qr_links:
+                write_qr_links(Path(args.append_only_qr_links), qr_lines)
         if args.build_qr_bundle:
             if not args.no_progress:
                 print("[progress] 正在打包二维码与链接文件...", file=sys.stderr, flush=True)
+            bundle_qr_lines = qr_lines
+            existing_bundle_path = None
+            if append_mode and args.existing_qr_bundle:
+                existing_bundle_path = Path(args.existing_qr_bundle)
+            elif append_mode and Path(args.qr_bundle_zip).exists():
+                existing_bundle_path = Path(args.qr_bundle_zip)
+            if append_mode and not existing_bundle_path:
+                bundle_qr_lines = build_qr_links(
+                    vless_lines=merged_share_lines,
+                    qr_api_base=args.qr_api_base,
+                    qr_size=args.qr_size,
+                )
             qr_bundle_count = build_qr_bundle(
-                qr_lines=qr_lines,
+                qr_lines=bundle_qr_lines,
                 bundle_zip_path=Path(args.qr_bundle_zip),
-                share_lines=share_lines,
+                share_lines=merged_share_lines,
                 links_filename=Path(args.links_file).name,
+                existing_bundle_path=existing_bundle_path,
             )
+            if append_mode and args.append_only_qr_bundle_zip:
+                build_qr_bundle(
+                    qr_lines=qr_lines,
+                    bundle_zip_path=Path(args.append_only_qr_bundle_zip),
+                    share_lines=share_lines,
+                    links_filename=Path(args.append_only_links_file or args.links_file).name,
+                    existing_bundle_path=None,
+                )
             if not args.no_progress:
                 print("[progress] 二维码压缩包已生成", file=sys.stderr, flush=True)
     write_mapping_csv(Path(args.mapping), mapping)
@@ -868,14 +1103,21 @@ def main() -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
-    print(f"generated: {output_path} ({len(mapping)} inbounds)")
+    action = "appended" if args.append_to_config else "generated"
+    print(f"{action}: {output_path} ({len(mapping)} new inbounds from port {append_start_port})")
     print(f"generated: {args.mapping}")
     if args.public_host:
         if not args.no_link_files:
             print(f"generated: {args.links_file}")
             print(f"generated: {args.qr_links}")
+            if append_mode and args.append_only_links_file:
+                print(f"generated: {args.append_only_links_file}")
+            if append_mode and args.append_only_qr_links:
+                print(f"generated: {args.append_only_qr_links}")
         if args.build_qr_bundle:
             print(f"generated: {args.qr_bundle_zip} ({qr_bundle_count} png + {Path(args.links_file).name})")
+            if append_mode and args.append_only_qr_bundle_zip:
+                print(f"generated: {args.append_only_qr_bundle_zip}")
         if args.print_links:
             print("=== unified vless links ===")
             for link in share_lines:

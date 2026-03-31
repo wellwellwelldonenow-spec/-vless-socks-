@@ -41,6 +41,9 @@ AUTO_FIX_SERVICE="${AUTO_FIX_SERVICE:-1}"
 SERVICE_NAME="${SERVICE_NAME:-xray-oneclick.service}"
 PUBLIC_FILES_DIR="${PUBLIC_FILES_DIR:-/opt/xray-oneclick/public}"
 QR_BUNDLE_ZIP="${QR_BUNDLE_ZIP:-${PUBLIC_FILES_DIR}/qr_bundle.zip}"
+APPEND_ONLY_LINKS_FILE="${APPEND_ONLY_LINKS_FILE:-${PUBLIC_FILES_DIR}/append_links_latest.txt}"
+APPEND_ONLY_QR_LINKS_FILE="${APPEND_ONLY_QR_LINKS_FILE:-${PUBLIC_FILES_DIR}/append_qr_links_latest.txt}"
+APPEND_ONLY_QR_BUNDLE_ZIP="${APPEND_ONLY_QR_BUNDLE_ZIP:-${PUBLIC_FILES_DIR}/append_qr_bundle_latest.zip}"
 FILE_HTTP_PORT="${FILE_HTTP_PORT:-18089}"
 FILE_HTTP_PORT_FILE="${FILE_HTTP_PORT_FILE:-/opt/xray-oneclick/file_http_port}"
 FILE_SERVICE_NAME="${FILE_SERVICE_NAME:-xray-oneclick-files.service}"
@@ -55,6 +58,7 @@ START_PORT_FILE="${START_PORT_FILE:-/opt/xray-oneclick/start_port}"
 USE_SAVED_PORT=0
 DOWNLOAD_KEY=""
 NO_SERVICE_MODE=0
+APPEND_MODE=0
 APPEND_RESULT_TOTAL=0
 APPEND_RESULT_ADDED=0
 APPEND_RESULT_SKIPPED=0
@@ -248,18 +252,17 @@ list_nodes_db() {
   ' "${NODES_DB}"
 }
 
-append_nodes_from_input_to_db() {
+prepare_nodes_append_file() {
   local src="$1"
   local dedupe_mode="${2:-0}"
+  local dst="$3"
   local sanitized_tmp=""
-  local append_tmp=""
   local total=0
   local added=0
   local skipped=0
   ensure_nodes_db_dir
   touch "${NODES_DB}"
   sanitized_tmp="$(mktemp /tmp/node_sanitized.XXXXXX)"
-  append_tmp="$(mktemp /tmp/node_append.XXXXXX)"
   awk '
     {
       line = $0
@@ -300,23 +303,33 @@ append_nodes_from_input_to_db() {
         seen[line] = 1
         print line
       }
-    ' "${sanitized_tmp}" > "${append_tmp}"
+    ' "${sanitized_tmp}" > "${dst}"
   else
-    cp -f "${sanitized_tmp}" "${append_tmp}"
+    cp -f "${sanitized_tmp}" "${dst}"
   fi
-  added="$(wc -l < "${append_tmp}" | tr -d '[:space:]')"
+  added="$(wc -l < "${dst}" | tr -d '[:space:]')"
   skipped=$(( total - added ))
-  if (( added > 0 )); then
-    cat "${append_tmp}" >> "${NODES_DB}"
-  fi
-  rm -f "${sanitized_tmp}" "${append_tmp}"
+  rm -f "${sanitized_tmp}"
   APPEND_RESULT_TOTAL="${total}"
   APPEND_RESULT_ADDED="${added}"
   APPEND_RESULT_SKIPPED="${skipped}"
 }
 
+append_entries_to_nodes_db() {
+  local src="$1"
+  if [[ ! -f "${src}" ]]; then
+    echo "ERROR: append source file not found: ${src}" >&2
+    return 1
+  fi
+  ensure_nodes_db_dir
+  touch "${NODES_DB}"
+  cat "${src}" >> "${NODES_DB}"
+  return 0
+}
+
 collect_nodes_append_to_db() {
   local tmp=""
+  local deduped_tmp=""
   local line=""
   local cleaned=""
   local normalized=""
@@ -359,7 +372,8 @@ collect_nodes_append_to_db() {
     echo "未新增任何节点"
     return 1
   fi
-  append_nodes_from_input_to_db "${tmp}" "${dedupe_mode}"
+  deduped_tmp="$(mktemp /tmp/node_add_deduped.XXXXXX)"
+  prepare_nodes_append_file "${tmp}" "${dedupe_mode}" "${deduped_tmp}"
   rm -f "${tmp}"
   if [[ "${end_reason}" == "double-enter" ]]; then
     echo "检测到连续两次回车，接收 ${data_count} 条节点输入。"
@@ -368,14 +382,23 @@ collect_nodes_append_to_db() {
   fi
   if [[ "${dedupe_mode}" == "1" ]]; then
     if (( APPEND_RESULT_ADDED <= 0 )); then
+      rm -f "${deduped_tmp}"
       echo "排重完成，本次输入 ${APPEND_RESULT_TOTAL} 条，全部重复，未新增节点。"
       return 1
     fi
     echo "排重完成，本次输入 ${APPEND_RESULT_TOTAL} 条，新增 ${APPEND_RESULT_ADDED} 条，跳过重复 ${APPEND_RESULT_SKIPPED} 条。"
   else
+    if (( APPEND_RESULT_ADDED <= 0 )); then
+      rm -f "${deduped_tmp}"
+      echo "未新增任何节点。"
+      return 1
+    fi
     echo "新增 ${APPEND_RESULT_ADDED} 条节点。"
   fi
-  echo "新增完成，已写入: ${NODES_DB}"
+  APPEND_MODE=1
+  INPUT_TMP="${deduped_tmp}"
+  INPUT_FILE="${INPUT_TMP}"
+  echo "新增节点已暂存，部署成功后将追加写入: ${NODES_DB}"
   return 0
 }
 
@@ -894,8 +917,6 @@ EOF
       7) show_qr_bundle_download ;;
       8)
         if collect_nodes_append_to_db; then
-          INPUT_FILE="${NODES_DB}"
-          USE_SAVED_PORT=1
           return 0
         fi
         ;;
@@ -1325,7 +1346,26 @@ if [[ -t 0 && -z "${INPUT_FILE}" && "${MENU_ENABLED}" == "1" ]]; then
   interactive_menu
 fi
 
-if [[ "${USE_SAVED_PORT}" == "1" ]]; then
+if [[ "${APPEND_MODE}" == "1" && ! -f "${DEPLOY_TARGET}" ]]; then
+  local_combined_input="$(mktemp /tmp/xray_full_from_append.XXXXXX.txt)"
+  if [[ -f "${NODES_DB}" ]]; then
+    awk '
+      /^[[:space:]]*$/ {next}
+      /^[[:space:]]*#/ {next}
+      {print}
+    ' "${NODES_DB}" > "${local_combined_input}"
+  fi
+  cat "${INPUT_FILE}" >> "${local_combined_input}"
+  INPUT_TMP="${local_combined_input}"
+  INPUT_FILE="${INPUT_TMP}"
+  APPEND_MODE=0
+  USE_SAVED_PORT=1
+  echo "未检测到现有部署配置，已改为基于节点库全量生成。"
+fi
+
+if [[ "${APPEND_MODE}" == "1" ]]; then
+  :
+elif [[ "${USE_SAVED_PORT}" == "1" ]]; then
   load_saved_start_port || prompt_start_port
 elif [[ -t 0 ]]; then
   prompt_start_port
@@ -1391,7 +1431,7 @@ if [[ "${ENTRY_COUNT}" -le 0 ]]; then
   exit 1
 fi
 
-if ! check_port_conflicts "${START_PORT}" "${ENTRY_COUNT}"; then
+if [[ "${APPEND_MODE}" != "1" ]] && ! check_port_conflicts "${START_PORT}" "${ENTRY_COUNT}"; then
   if [[ -t 0 ]]; then
     SUGGESTED_PORT="$(find_free_start_port "${ENTRY_COUNT}" "${START_PORT_DEFAULT}" || true)"
     if [[ -n "${SUGGESTED_PORT}" ]]; then
@@ -1413,6 +1453,8 @@ if ! check_port_conflicts "${START_PORT}" "${ENTRY_COUNT}"; then
   fi
 fi
 
+mkdir -p "${PUBLIC_FILES_DIR}"
+
 ARGS=(
   "--output" "${OUTPUT_CONFIG}"
   "--mapping" "${OUTPUT_MAPPING}"
@@ -1428,13 +1470,23 @@ ARGS=(
   "--remark-prefix" "${REMARK_PREFIX}"
   "--fingerprint" "${FINGERPRINT}"
   "--spx" "${SPX}"
+  "--links-file" "${PUBLIC_FILES_DIR}/links.txt"
+  "--qr-links" "${PUBLIC_FILES_DIR}/qr_links.txt"
   "--qr-size" "${QR_SIZE}"
   "--qr-bundle-zip" "${QR_BUNDLE_ZIP}"
   "--build-qr-bundle"
-  "--no-link-files"
   "--print-links"
   "--print-qr"
 )
+
+if [[ "${APPEND_MODE}" == "1" ]]; then
+  ARGS+=("--append-to-config" "${DEPLOY_TARGET}")
+  ARGS+=("--existing-links-file" "${PUBLIC_FILES_DIR}/links.txt")
+  ARGS+=("--existing-qr-bundle" "${QR_BUNDLE_ZIP}")
+  ARGS+=("--append-only-links-file" "${APPEND_ONLY_LINKS_FILE}")
+  ARGS+=("--append-only-qr-links" "${APPEND_ONLY_QR_LINKS_FILE}")
+  ARGS+=("--append-only-qr-bundle-zip" "${APPEND_ONLY_QR_BUNDLE_ZIP}")
+fi
 
 if [[ -n "${RELOAD_CMD}" ]]; then
   ARGS+=("--reload-cmd" "${RELOAD_CMD}")
@@ -1452,8 +1504,12 @@ else
 fi
 
 if [[ -n "${INPUT_FILE}" ]]; then
-  persist_nodes_db_from_input "${INPUT_FILE}"
-  save_start_port
+  if [[ "${APPEND_MODE}" == "1" ]]; then
+    append_entries_to_nodes_db "${INPUT_FILE}"
+  else
+    persist_nodes_db_from_input "${INPUT_FILE}"
+    save_start_port
+  fi
 fi
 
 if [[ "${NO_SERVICE_MODE}" == "1" ]]; then
@@ -1477,7 +1533,22 @@ if [[ "${AUTO_QR_FILE_SERVER}" == "1" ]] && [[ -f "${QR_BUNDLE_ZIP}" ]]; then
     echo "http://${PUBLIC_HOST}:${FILE_HTTP_PORT}/"
     if [[ -n "${DOWNLOAD_KEY}" ]]; then
       echo "下载密钥: ${DOWNLOAD_KEY}"
-      echo "（可选直链）http://${PUBLIC_HOST}:${FILE_HTTP_PORT}/download?k=${DOWNLOAD_KEY}"
+      if [[ "${APPEND_MODE}" == "1" ]]; then
+        if [[ -f "${APPEND_ONLY_QR_BUNDLE_ZIP}" ]]; then
+          echo "本次新增节点独立二维码包:"
+          echo "http://${PUBLIC_HOST}:${FILE_HTTP_PORT}/download?file=$(basename "${APPEND_ONLY_QR_BUNDLE_ZIP}")&k=${DOWNLOAD_KEY}"
+        fi
+        if [[ -f "${APPEND_ONLY_LINKS_FILE}" ]]; then
+          echo "本次新增节点独立链接文件:"
+          echo "http://${PUBLIC_HOST}:${FILE_HTTP_PORT}/download?file=$(basename "${APPEND_ONLY_LINKS_FILE}")&k=${DOWNLOAD_KEY}"
+        fi
+        if [[ -f "${APPEND_ONLY_QR_LINKS_FILE}" ]]; then
+          echo "本次新增节点独立二维码链接文件:"
+          echo "http://${PUBLIC_HOST}:${FILE_HTTP_PORT}/download?file=$(basename "${APPEND_ONLY_QR_LINKS_FILE}")&k=${DOWNLOAD_KEY}"
+        fi
+      else
+        echo "（可选直链）http://${PUBLIC_HOST}:${FILE_HTTP_PORT}/download?k=${DOWNLOAD_KEY}"
+      fi
     else
       echo "下载密钥尚未生成"
     fi
