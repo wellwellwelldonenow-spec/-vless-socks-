@@ -55,6 +55,9 @@ START_PORT_FILE="${START_PORT_FILE:-/opt/xray-oneclick/start_port}"
 USE_SAVED_PORT=0
 DOWNLOAD_KEY=""
 NO_SERVICE_MODE=0
+APPEND_RESULT_TOTAL=0
+APPEND_RESULT_ADDED=0
+APPEND_RESULT_SKIPPED=0
 
 usage() {
   cat <<'EOF'
@@ -245,6 +248,73 @@ list_nodes_db() {
   ' "${NODES_DB}"
 }
 
+append_nodes_from_input_to_db() {
+  local src="$1"
+  local dedupe_mode="${2:-0}"
+  local sanitized_tmp=""
+  local append_tmp=""
+  local total=0
+  local added=0
+  local skipped=0
+  ensure_nodes_db_dir
+  touch "${NODES_DB}"
+  sanitized_tmp="$(mktemp /tmp/node_sanitized.XXXXXX)"
+  append_tmp="$(mktemp /tmp/node_append.XXXXXX)"
+  awk '
+    {
+      line = $0
+      sub(/^[[:space:]]+/, "", line)
+      sub(/[[:space:]]+$/, "", line)
+      if (line == "" || line ~ /^#/) {
+        next
+      }
+      print line
+    }
+  ' "${src}" > "${sanitized_tmp}"
+  total="$(wc -l < "${sanitized_tmp}" | tr -d '[:space:]')"
+  if [[ "${dedupe_mode}" == "1" ]]; then
+    awk -v db="${NODES_DB}" '
+      function trim(s) {
+        sub(/^[[:space:]]+/, "", s)
+        sub(/[[:space:]]+$/, "", s)
+        return s
+      }
+      BEGIN {
+        while ((getline line < db) > 0) {
+          line = trim(line)
+          if (line == "" || line ~ /^#/) {
+            continue
+          }
+          seen[line] = 1
+        }
+        close(db)
+      }
+      {
+        line = trim($0)
+        if (line == "" || line ~ /^#/) {
+          next
+        }
+        if (seen[line]) {
+          next
+        }
+        seen[line] = 1
+        print line
+      }
+    ' "${sanitized_tmp}" > "${append_tmp}"
+  else
+    cp -f "${sanitized_tmp}" "${append_tmp}"
+  fi
+  added="$(wc -l < "${append_tmp}" | tr -d '[:space:]')"
+  skipped=$(( total - added ))
+  if (( added > 0 )); then
+    cat "${append_tmp}" >> "${NODES_DB}"
+  fi
+  rm -f "${sanitized_tmp}" "${append_tmp}"
+  APPEND_RESULT_TOTAL="${total}"
+  APPEND_RESULT_ADDED="${added}"
+  APPEND_RESULT_SKIPPED="${skipped}"
+}
+
 collect_nodes_append_to_db() {
   local tmp=""
   local line=""
@@ -253,7 +323,14 @@ collect_nodes_append_to_db() {
   local blank_count=0
   local data_count=0
   local end_reason=""
+  local dedupe_choice=""
+  local dedupe_mode=1
   tmp="$(mktemp /tmp/node_add.XXXXXX)"
+  read -r -p "自动排除重复 SOCKS、只追加新节点吗？[Y/n]: " dedupe_choice || true
+  dedupe_choice="$(echo "${dedupe_choice}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+  if [[ "${dedupe_choice}" == "n" || "${dedupe_choice}" == "no" ]]; then
+    dedupe_mode=0
+  fi
   echo "请粘贴要新增的 SOCKS（格式 host:port:user:pass）"
   echo "结束方式: end / END / 结束 / done / q / . / 连续两次回车 / Ctrl+D"
   while IFS= read -r line || [[ -n "${line}" ]]; do
@@ -282,14 +359,21 @@ collect_nodes_append_to_db() {
     echo "未新增任何节点"
     return 1
   fi
-  ensure_nodes_db_dir
-  touch "${NODES_DB}"
-  cat "${tmp}" >> "${NODES_DB}"
+  append_nodes_from_input_to_db "${tmp}" "${dedupe_mode}"
   rm -f "${tmp}"
   if [[ "${end_reason}" == "double-enter" ]]; then
-    echo "检测到连续两次回车，新增 ${data_count} 条节点。"
+    echo "检测到连续两次回车，接收 ${data_count} 条节点输入。"
   elif [[ "${end_reason}" == "marker" ]]; then
-    echo "检测到结束标记，新增 ${data_count} 条节点。"
+    echo "检测到结束标记，接收 ${data_count} 条节点输入。"
+  fi
+  if [[ "${dedupe_mode}" == "1" ]]; then
+    if (( APPEND_RESULT_ADDED <= 0 )); then
+      echo "排重完成，本次输入 ${APPEND_RESULT_TOTAL} 条，全部重复，未新增节点。"
+      return 1
+    fi
+    echo "排重完成，本次输入 ${APPEND_RESULT_TOTAL} 条，新增 ${APPEND_RESULT_ADDED} 条，跳过重复 ${APPEND_RESULT_SKIPPED} 条。"
+  else
+    echo "新增 ${APPEND_RESULT_ADDED} 条节点。"
   fi
   echo "新增完成，已写入: ${NODES_DB}"
   return 0
@@ -790,7 +874,7 @@ interactive_menu() {
 5) 停止服务
 6) 查看最近日志
 7) 显示二维码压缩包下载信息
-8) 新增节点（追加）
+8) 新增节点（追加，可选排重）
 9) 删除单个节点
 10) 批量删除节点
 11) 查看节点库
