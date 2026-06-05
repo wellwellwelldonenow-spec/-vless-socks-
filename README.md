@@ -13,6 +13,19 @@
 - 自动探测公网 IP
 - 缺少 xray 时自动安装（优先本地 zip）
 
+## 国家检测更准的方式
+
+默认会先探测每个 SOCKS 的出口 IP，再用在线 Geo API 查询国家。节点很多时，在线 API 容易超时、限流或返回空值，所以会出现 `Unknown`。
+
+更准、更稳定的方式是使用本地 MMDB 国家库：
+
+```bash
+python3 -m pip install maxminddb
+COUNTRY_MMDB=/path/to/GeoLite2-Country.mmdb ./start_xray_oneclick.sh
+```
+
+也可以把 `GeoLite2-Country.mmdb` 或 `Country.mmdb` 放到项目目录、`/usr/share/GeoIP/`、`/usr/local/share/GeoIP/`、`/var/lib/GeoIP/` 或 `/opt/xray-oneclick/`，脚本会自动发现。
+
 ## 本机直接运行
 
 ```bash
@@ -116,6 +129,7 @@ xray-oneclick-uninstall
 ## 环境变量
 
 - `PUBLIC_HOST`：公网 IP 或域名（不填则自动探测）
+- `COUNTRY_MMDB`：本地 MMDB 国家库路径（更准且避免在线 API 限流）
 - `XRAY_BIN`：xray 可执行文件路径
 - `DEPLOY_TARGET`：配置部署路径（默认 `/usr/local/etc/xray/config.json`）
 - `RELOAD_CMD`：重载命令（默认 `systemctl reload xray`）

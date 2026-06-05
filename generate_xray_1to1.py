@@ -31,6 +31,7 @@ except ImportError:
 HOST_RE = re.compile(r"^[A-Za-z0-9.-]+$")
 INBOUND_TAG_RE = re.compile(r"^in-(\d+)$")
 OUTBOUND_TAG_RE = re.compile(r"^out-(\d+)$")
+COUNTRY_MMDB_WARNED = False
 
 
 @dataclass
@@ -554,6 +555,10 @@ def parse_args() -> argparse.Namespace:
         help="Concurrent workers for SOCKS egress IP probing (default: 20)",
     )
     parser.add_argument(
+        "--country-mmdb",
+        help="Optional MaxMind-compatible country MMDB path for local IP geolocation",
+    )
+    parser.add_argument(
         "--no-progress",
         action="store_true",
         help="Disable progress logs during generation",
@@ -592,23 +597,104 @@ def build_vless_link(
 
 def sanitize_remark(text: str) -> str:
     text = text.strip().replace(" ", "-")
-    text = re.sub(r"[^A-Za-z0-9._-]+", "-", text)
+    text = re.sub(r"[^\w._-]+", "-", text)
     text = re.sub(r"-{2,}", "-", text).strip("-")
     return text or "node"
 
 
-def query_country_by_ip(ip_or_host: str) -> str:
+def _country_from_mmdb_record(record: dict) -> str:
+    for flat_key in ("country_name", "country", "country_code", "country_code2"):
+        value = record.get(flat_key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    for key in ("country", "registered_country", "represented_country"):
+        value = record.get(key)
+        if not isinstance(value, dict):
+            continue
+        names = value.get("names")
+        if isinstance(names, dict):
+            for name_key in ("zh-CN", "zh", "en"):
+                name = str(names.get(name_key, "")).strip()
+                if name:
+                    return name
+        iso_code = str(value.get("iso_code", "")).strip()
+        if iso_code:
+            return iso_code
+    return ""
+
+
+def query_country_by_mmdb(ip_or_host: str, mmdb_path: str | None) -> str:
+    global COUNTRY_MMDB_WARNED
+    if not mmdb_path:
+        return ""
+    path = Path(mmdb_path)
+    if not path.is_file():
+        return ""
+    try:
+        import maxminddb  # type: ignore[import-not-found]
+    except ImportError:
+        if not COUNTRY_MMDB_WARNED:
+            print(
+                "WARN: country MMDB configured but Python package 'maxminddb' is not installed; "
+                "falling back to online Geo APIs",
+                file=sys.stderr,
+            )
+            COUNTRY_MMDB_WARNED = True
+        return ""
+    try:
+        with maxminddb.open_database(str(path)) as reader:
+            record = reader.get(ip_or_host)
+    except Exception:
+        return ""
+    if isinstance(record, dict):
+        return _country_from_mmdb_record(record)
+    return ""
+
+
+def _read_geo_json(url: str) -> dict:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "xray-oneclick/1.0",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=4.5) as resp:
+        return json.loads(resp.read().decode("utf-8", "ignore"))
+
+
+def query_country_by_ip(ip_or_host: str, mmdb_path: str | None = None) -> str:
+    mmdb_country = query_country_by_mmdb(ip_or_host, mmdb_path)
+    if mmdb_country:
+        return mmdb_country
+
     providers = [
-        (f"https://ipwho.is/{urllib.parse.quote(ip_or_host)}", "country"),
-        (f"https://ipapi.co/{urllib.parse.quote(ip_or_host)}/json/", "country_name"),
+        (
+            f"https://ipwho.is/{urllib.parse.quote(ip_or_host)}",
+            lambda data: "" if data.get("success") is False else str(data.get("country", "")).strip(),
+        ),
+        (
+            f"https://ipapi.co/{urllib.parse.quote(ip_or_host)}/json/",
+            lambda data: "" if data.get("error") else str(data.get("country_name", "")).strip(),
+        ),
+        (
+            f"http://ip-api.com/json/{urllib.parse.quote(ip_or_host)}?fields=status,message,country,countryCode",
+            lambda data: str(data.get("country", "") or data.get("countryCode", "")).strip()
+            if data.get("status") == "success"
+            else "",
+        ),
+        (
+            f"https://ipinfo.io/{urllib.parse.quote(ip_or_host)}/json",
+            lambda data: str(data.get("country", "")).strip(),
+        ),
     ]
-    for url, key in providers:
+    for url, parser in providers:
         try:
-            with urllib.request.urlopen(url, timeout=3.5) as resp:
-                data = json.loads(resp.read().decode("utf-8", "ignore"))
+            data = _read_geo_json(url)
         except Exception:
             continue
-        value = str(data.get(key, "")).strip()
+        value = parser(data)
         if value and value.lower() not in {"none", "null"}:
             return value
     return "Unknown"
@@ -623,29 +709,31 @@ def detect_exit_ip_via_socks(entry: SocksEntry, timeout_sec: float) -> str:
     proxy = f"socks5h://{entry.host}:{entry.port}"
     auth = f"{entry.username}:{entry.password}"
     providers = [
-        "https://api64.ipify.org",
-        "https://ifconfig.me/ip",
-        "https://icanhazip.com",
-        "https://ipinfo.io/ip",
+        ("-4", "https://api64.ipify.org"),
+        ("-4", "https://ifconfig.me/ip"),
+        ("-4", "https://icanhazip.com"),
+        ("-4", "https://ipinfo.io/ip"),
+        ("", "https://api64.ipify.org"),
+        ("", "https://ifconfig.me/ip"),
+        ("", "https://icanhazip.com"),
+        ("", "https://ipinfo.io/ip"),
     ]
-    for url in providers:
+    for ip_flag, url in providers:
+        cmd = [
+            curl_bin,
+            "-fsS",
+            "--max-time",
+            str(timeout_sec),
+            "--proxy",
+            proxy,
+            "--proxy-user",
+            auth,
+            url,
+        ]
+        if ip_flag:
+            cmd.insert(1, ip_flag)
         try:
-            proc = subprocess.run(
-                [
-                    curl_bin,
-                    "-4fsS",
-                    "--max-time",
-                    str(timeout_sec),
-                    "--proxy",
-                    proxy,
-                    "--proxy-user",
-                    auth,
-                    url,
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
         except Exception:
             continue
         if proc.returncode != 0:
@@ -658,7 +746,7 @@ def detect_exit_ip_via_socks(entry: SocksEntry, timeout_sec: float) -> str:
             ip = ipaddress.ip_address(candidate)
         except ValueError:
             continue
-        if ip.version == 4:
+        if ip.version in (4, 6) and ip.is_global:
             return str(ip)
     return ""
 
@@ -711,6 +799,7 @@ def build_share_links(
     remark_prefix: str,
     exit_ip_timeout: float,
     exit_ip_workers: int,
+    country_mmdb: str | None,
     show_progress: bool,
 ) -> list[str]:
     share_lines = []
@@ -732,7 +821,7 @@ def build_share_links(
         entry = entries[idx]
         exit_ip = exit_ips[idx] if idx < len(exit_ips) else ""
         if exit_ip and exit_ip not in country_cache:
-            country_cache[exit_ip] = query_country_by_ip(exit_ip)
+            country_cache[exit_ip] = query_country_by_ip(exit_ip, country_mmdb)
         country = country_cache.get(exit_ip, "Unknown") if exit_ip else "Unknown"
         row["socks_exit_ip"] = exit_ip
         row["socks_exit_country"] = country
@@ -1025,6 +1114,7 @@ def main() -> int:
             remark_prefix=args.remark_prefix,
             exit_ip_timeout=args.exit_ip_timeout,
             exit_ip_workers=args.exit_ip_workers,
+            country_mmdb=args.country_mmdb,
             show_progress=not args.no_progress,
         )
         merged_share_lines = share_lines

@@ -24,6 +24,7 @@ DEST="${DEST:-www.cloudflare.com:443}"
 FLOW="${FLOW:-xtls-rprx-vision}"
 PUBLIC_HOST="${PUBLIC_HOST:-}"
 REMARK_PREFIX="${REMARK_PREFIX:-node}"
+COUNTRY_MMDB="${COUNTRY_MMDB:-}"
 FINGERPRINT="${FINGERPRINT:-chrome}"
 SPX="${SPX:-/}"
 QR_SIZE="${QR_SIZE:-300}"
@@ -90,6 +91,7 @@ Key env vars:
   START_PORT        inbound start port (default: 20000)
   SERVER_NAME       reality sni (default: www.cloudflare.com)
   DEST              reality dest (default: www.cloudflare.com:443)
+  COUNTRY_MMDB      local MaxMind-compatible country MMDB for country detection
   QR_SIZE           QR image size (default: 300)
   KEEP_ARTIFACTS    keep generated temp files (1 to keep, default: 0)
   AUTO_INSTALL_XRAY auto-install xray if missing (1/0, default: 1)
@@ -555,6 +557,26 @@ PY
     fi
   fi
 
+  return 1
+}
+
+detect_country_mmdb() {
+  local candidate=""
+  for candidate in \
+    "${BASE_DIR}/GeoLite2-Country.mmdb" \
+    "${BASE_DIR}/Country.mmdb" \
+    "/usr/share/GeoIP/GeoLite2-Country.mmdb" \
+    "/usr/share/GeoIP/GeoIP2-Country.mmdb" \
+    "/usr/local/share/GeoIP/GeoLite2-Country.mmdb" \
+    "/usr/local/share/GeoIP/GeoIP2-Country.mmdb" \
+    "/var/lib/GeoIP/GeoLite2-Country.mmdb" \
+    "/opt/xray-oneclick/GeoLite2-Country.mmdb" \
+    "/opt/xray-oneclick/Country.mmdb"; do
+    if [[ -f "${candidate}" ]]; then
+      echo "${candidate}"
+      return 0
+    fi
+  done
   return 1
 }
 
@@ -1455,6 +1477,18 @@ fi
 
 mkdir -p "${PUBLIC_FILES_DIR}"
 
+if [[ -z "${COUNTRY_MMDB}" ]]; then
+  COUNTRY_MMDB="$(detect_country_mmdb || true)"
+fi
+if [[ -n "${COUNTRY_MMDB}" ]]; then
+  if [[ -f "${COUNTRY_MMDB}" ]]; then
+    echo "using COUNTRY_MMDB=${COUNTRY_MMDB}"
+  else
+    echo "WARN: COUNTRY_MMDB not found, online Geo APIs will be used: ${COUNTRY_MMDB}" >&2
+    COUNTRY_MMDB=""
+  fi
+fi
+
 ARGS=(
   "--output" "${OUTPUT_CONFIG}"
   "--mapping" "${OUTPUT_MAPPING}"
@@ -1494,6 +1528,10 @@ fi
 
 if [[ "${PER_INBOUND_KEY}" == "1" ]]; then
   ARGS+=("--per-inbound-key")
+fi
+
+if [[ -n "${COUNTRY_MMDB}" ]]; then
+  ARGS+=("--country-mmdb" "${COUNTRY_MMDB}")
 fi
 
 if [[ -n "${INPUT_FILE}" ]]; then
